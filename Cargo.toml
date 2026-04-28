@@ -1,0 +1,30 @@
+[package]
+name = "verst"
+version = "0.1.0"
+edition = "2024"
+authors = ["Dimas Prabowo <dimasprabowo98@icloud.com>"]
+description = "High-performance Single-node Object Storage with Integrated Vector Search"
+
+[dependencies]
+# Storage & Database
+sled = "0.34"
+memmap2 = "0.9"
+bincode = "3.0"
+serde = { version = "1.0", features = ["derive"] }
+
+# AI & Math
+candle-core = "0.10"
+ndarray = "0.17"
+
+# Concurrency & Async
+tokio = { version = "1.0", features = ["full"] }
+arc-swap = "1.9"
+
+# API & Networking
+axum = "0.8"
+tonic = "0.14"
+
+# Utilities
+uuid = { version = "1.23", features = ["v4", "serde"] }
+anyhow = "1.0"
+tracing = "0.1"
