@@ -8,8 +8,8 @@ use std::{
 use bytemuck::{Pod, Zeroable};
 use chrono::Utc;
 
-pub const MAGIC_NUMBER: u32 = 0xDEADBEEF;
-pub const MAX_VECTOR_SIZE: usize = 10_000;
+const MAGIC_NUMBER: u32 = 0xDEADBEEF;
+const MAX_VECTOR_SIZE: usize = 10_000;
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,10 +115,10 @@ impl WalWriter {
         };
         let header_bytes = bytemuck::bytes_of(&header);
 
-        let mut combined = Vec::with_capacity(header_bytes.len() + payload.len());
-        combined.extend_from_slice(header_bytes);
-        combined.extend_from_slice(payload);
-        self.writer.write_all(&combined)?;
+        let mut entry = Vec::with_capacity(header_bytes.len() + payload.len());
+        entry.extend_from_slice(header_bytes);
+        entry.extend_from_slice(payload);
+        self.writer.write_all(&entry)?;
 
         self.writer.flush()?;
         self.writer.get_ref().sync_data()?;
