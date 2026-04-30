@@ -97,6 +97,30 @@ impl Blob<Active> {
         })
     }
 
+    fn new_for_compaction<P>(id: u64, base_dir: P) -> io::Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        let shard_dir = Self::compute_shard_path(base_dir, id);
+        fs::create_dir_all(&shard_dir)?;
+
+        let filename = format!("v-{0:16}.blob", id);
+        let path = shard_dir.join(filename);
+
+        let file = OpenOptions::new()
+            .read(true)
+            .append(true)
+            .create(true)
+            .open(&path)?;
+
+        Ok(Self {
+            id,
+            path,
+            file,
+            state: Active,
+        })
+    }
+
     pub fn ingest(&mut self, id: u64, data: &[u8]) -> io::Result<u64> {
         let offset = self.file.stream_position()?;
         let header = BlobEntryHeader {
@@ -121,7 +145,7 @@ impl Blob<Active> {
         Ok(offset)
     }
 
-    pub fn seal<P>(self, base_dir: P) -> io::Result<Blob<Sealed>>
+    pub fn seal<P>(mut self, base_dir: P) -> io::Result<Blob<Sealed>>
     where
         P: AsRef<Path>,
     {
@@ -133,6 +157,10 @@ impl Blob<Active> {
             .file_name()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
         let sealed_path = shard_dir.join(file_name);
+
+        let final_size = self.file.stream_position()?;
+        self.file.set_len(final_size)?;
+        self.file.sync_all()?;
 
         fs::rename(&self.path, &sealed_path)?;
         let file = File::open(&sealed_path)?;
@@ -151,7 +179,7 @@ impl Blob<Sealed> {
     where
         P: AsRef<Path>,
     {
-        let mut ingestor = Blob::<Active>::new(self.id, &base_dir, threshold)?;
+        let mut ingestor = Blob::<Active>::new_for_compaction(self.id, &base_dir)?;
         let mut mapping = Vec::new();
 
         let mut source_file = &self.file;
