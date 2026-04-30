@@ -23,4 +23,4 @@
    (1) Blob is saved
    (2) Vector is appended
    (3) Sled metadata is updated.
-   Otherwise, roll back (truncate vector file).
+   Otherwise, roll back (truncate vecdocs(architecture): fix name file typor file).
