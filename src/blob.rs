@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -20,17 +20,23 @@ const SHARD_COUNT: u64 = 100;
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct BlobEntryHeader {
-    object_id: u64,
     magic: u32,
     data_len: u32,
+    object_id: u64,
     checksum: u32,
     _padding: u32,
 }
 
 pub struct OffsetMap {
     pub object_id: u64,
+    pub old_blob_id: u64,
     pub old_offset: u64,
     pub new_offset: u64,
+}
+
+pub struct CompactedBlob {
+    pub new_blob: Blob<Optimized>,
+    pub removed_blob_ids: Vec<u64>,
 }
 
 // MARK: - State Machine
@@ -40,19 +46,21 @@ pub trait BlobState {}
 pub struct Active;
 pub struct Sealed;
 pub struct Optimized {
-    pub mapping: Vec<OffsetMap>,
+    pub mappings: Vec<OffsetMap>,
 }
 
 impl BlobState for Active {}
 impl BlobState for Sealed {}
 impl BlobState for Optimized {}
 
-// MARK: - Core Container
+// MARK: - Storage
 
-struct Blob<S: BlobState> {
+pub struct Blob<S: BlobState> {
     id: u64,
     path: PathBuf,
     file: File,
+    page_size: u64,
+    threshold: u64,
     pub state: S,
 }
 
@@ -68,17 +76,62 @@ impl<S: BlobState> Blob<S> {
         let shard = blob_id % SHARD_COUNT;
         base_dir.as_ref().join(format!("{:02}", shard))
     }
+
+    pub fn read_entry(&mut self, offset: u64) -> io::Result<(BlobEntryHeader, Vec<u8>)> {
+        let file_len = self.file.metadata()?.len();
+        let header_size = size_of::<BlobEntryHeader>() as u64;
+
+        if offset + header_size > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "offset out of bounds",
+            ));
+        }
+
+        self.file.seek(SeekFrom::Start(offset))?;
+
+        let mut header_bytes = [0u8; size_of::<BlobEntryHeader>()];
+        self.file.read_exact(&mut header_bytes)?;
+
+        let header: BlobEntryHeader = *bytemuck::from_bytes(&header_bytes);
+
+        if header.magic != MAGIC_NUMBER {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid magic number",
+            ));
+        }
+
+        if offset + header_size + header.data_len as u64 > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "header claims more data than file contains",
+            ));
+        }
+
+        let mut data = vec![0u8; header.data_len as usize];
+        self.file.read_exact(&mut data)?;
+
+        if header.checksum != Hasher::hash(&data) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "checksum mismatch",
+            ));
+        }
+
+        Ok((header, data))
+    }
 }
 
 impl Blob<Active> {
-    pub fn new<P>(id: u64, base_dir: P, threshold: u64) -> io::Result<Self>
+    pub fn new<P>(id: u64, base_dir: P, threshold: u64, page_size: u64) -> io::Result<Self>
     where
         P: AsRef<Path>,
     {
         let shard_dir = Self::compute_shard_path(base_dir, id);
         fs::create_dir_all(&shard_dir)?;
 
-        let filename = format!("v-{0:16}.blob", id);
+        let filename = format!("v-{0:16}.blob.tmp", id);
         let path = shard_dir.join(filename);
 
         let file = OpenOptions::new()
@@ -93,46 +146,35 @@ impl Blob<Active> {
             id,
             path,
             file,
-            state: Active,
-        })
-    }
-
-    fn new_for_compaction<P>(id: u64, base_dir: P) -> io::Result<Self>
-    where
-        P: AsRef<Path>,
-    {
-        let shard_dir = Self::compute_shard_path(base_dir, id);
-        fs::create_dir_all(&shard_dir)?;
-
-        let filename = format!("v-{0:16}.blob", id);
-        let path = shard_dir.join(filename);
-
-        let file = OpenOptions::new()
-            .read(true)
-            .append(true)
-            .create(true)
-            .open(&path)?;
-
-        Ok(Self {
-            id,
-            path,
-            file,
+            page_size,
+            threshold,
             state: Active,
         })
     }
 
     pub fn ingest(&mut self, id: u64, data: &[u8]) -> io::Result<u64> {
         let offset = self.file.stream_position()?;
-        let header = BlobEntryHeader {
-            object_id: id,
-            magic: MAGIC_NUMBER,
-            data_len: data.len() as u32,
-            checksum: Hasher::hash(data.len(), data),
-            _padding: 0,
-        };
 
         let total_len = size_of::<BlobEntryHeader>() + data.len();
-        let padded_len = align_to_page(total_len as u64) as usize;
+        let padded_len = align_to_page(total_len as u64, self.page_size) as usize;
+
+        if offset + padded_len as u64 > self.threshold {
+            return Err(io::Error::new(
+                io::ErrorKind::StorageFull,
+                format!(
+                    "blob capacity reached. offset {} + needed {} > threshold {}",
+                    offset, padded_len, self.threshold
+                ),
+            ));
+        }
+
+        let header = BlobEntryHeader {
+            magic: MAGIC_NUMBER,
+            data_len: data.len() as u32,
+            object_id: id,
+            checksum: Hasher::hash(data),
+            _padding: 0,
+        };
 
         let mut entry = Vec::with_capacity(padded_len);
         entry.extend_from_slice(bytemuck::bytes_of(&header));
@@ -140,101 +182,186 @@ impl Blob<Active> {
         entry.resize(padded_len, 0);
 
         self.file.write_all(&entry)?;
-        self.file.sync_data()?;
 
         Ok(offset)
+    }
+
+    pub fn flush(&self) -> io::Result<()> {
+        self.file.sync_data()
     }
 
     pub fn seal<P>(mut self, base_dir: P) -> io::Result<Blob<Sealed>>
     where
         P: AsRef<Path>,
     {
+        let final_size = self.file.stream_position()?;
+        self.file.set_len(final_size)?; // Trim preallocation
+        self.file.sync_all()?;
+
         let shard_dir = Self::compute_shard_path(base_dir, self.id);
         fs::create_dir_all(&shard_dir)?;
 
         let file_name = self
             .path
-            .file_name()
+            .file_stem()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
         let sealed_path = shard_dir.join(file_name);
 
-        let final_size = self.file.stream_position()?;
-        self.file.set_len(final_size)?;
-        self.file.sync_all()?;
-
         fs::rename(&self.path, &sealed_path)?;
         let file = File::open(&sealed_path)?;
+
+        let dir = File::open(&shard_dir)?;
+        dir.sync_all()?;
 
         Ok(Blob {
             id: self.id,
             path: sealed_path,
             file,
+            page_size: self.page_size,
+            threshold: self.threshold,
             state: Sealed,
         })
     }
 }
 
 impl Blob<Sealed> {
-    pub fn optimize<P>(self, base_dir: P, threshold: u64) -> io::Result<Blob<Optimized>>
-    where
-        P: AsRef<Path>,
-    {
-        let mut ingestor = Blob::<Active>::new_for_compaction(self.id, &base_dir)?;
-        let mut mapping = Vec::new();
-
-        let mut source_file = &self.file;
-        let file_len = source_file.metadata()?.len();
+    pub fn scan_offsets(&mut self) -> io::Result<Vec<(u64, u64)>> {
+        let mut index = Vec::new();
+        let header_size = size_of::<BlobEntryHeader>() as u64;
+        let file_len = self.file.metadata()?.len();
         let mut cursor = 0;
 
-        while cursor < file_len {
-            source_file.seek(io::SeekFrom::Start(cursor))?;
+        while cursor + header_size <= file_len {
+            self.file.seek(SeekFrom::Start(cursor))?;
 
             let mut header_bytes = [0u8; size_of::<BlobEntryHeader>()];
-            if source_file.read_exact(&mut header_bytes).is_err() {
-                break; // End of file or partial write
+            if self.file.read_exact(&mut header_bytes).is_err() {
+                break;
             }
 
             let header: &BlobEntryHeader = bytemuck::from_bytes(&header_bytes);
 
             if header.magic != MAGIC_NUMBER {
-                cursor = align_to_page(cursor + 1);
+                let next_page = align_to_page(cursor + 1, self.page_size);
+                if next_page >= file_len {
+                    break;
+                }
+                cursor = next_page;
                 continue;
             }
 
-            let mut data = vec![0u8; header.data_len as usize];
-            if source_file.read_exact(&mut data).is_err() {
-                break; // Partial write
+            let total_entry_size = header_size + header.data_len as u64;
+            if cursor + total_entry_size > file_len {
+                break; // Corrupted header claims more data than exists.
             }
 
-            if header.checksum == Hasher::hash(data.len(), &data) {
-                let new_offset = ingestor.ingest(header.object_id, &data)?;
-                mapping.push(OffsetMap {
-                    object_id: header.object_id,
-                    old_offset: cursor,
-                    new_offset,
-                });
-            }
-
-            let entry_total_size = size_of::<BlobEntryHeader>() as u64 + header.data_len as u64;
-            cursor = align_to_page(cursor + entry_total_size);
+            index.push((header.object_id, cursor));
+            cursor = align_to_page(cursor + total_entry_size, self.page_size);
         }
 
-        let Blob {
-            path: opt_path,
-            file: ingestor_file,
-            ..
-        } = ingestor;
+        Ok(index)
+    }
+}
 
-        ingestor_file.sync_all()?;
-        drop(ingestor_file);
+// MARK: - Compaction
 
-        let opt_file = File::open(&opt_path)?;
+pub trait BlobCompactable {
+    fn compact<P>(
+        self,
+        base_dir: P,
+        threshold: u64,
+        page_size: u64,
+        new_id: u64,
+    ) -> io::Result<CompactedBlob>
+    where
+        P: AsRef<Path>;
+}
 
-        Ok(Blob {
-            id: self.id,
-            path: opt_path,
-            file: opt_file,
-            state: Optimized { mapping },
+impl BlobCompactable for Vec<Blob<Sealed>> {
+    fn compact<P>(
+        self,
+        base_dir: P,
+        threshold: u64,
+        page_size: u64,
+        new_id: u64,
+    ) -> io::Result<CompactedBlob>
+    where
+        P: AsRef<Path>,
+    {
+        let mut new_blob = Blob::<Active>::new(new_id, &base_dir, threshold, page_size)?;
+        let mut mappings = Vec::new();
+        let mut removed_ids = Vec::new();
+
+        let mut opt_data = Vec::with_capacity(1024 * 1024);
+        let header_size = size_of::<BlobEntryHeader>() as u64;
+
+        for mut source in self {
+            let file_len = source.file.metadata()?.len();
+            let mut cursor = 0;
+            removed_ids.push(source.id);
+
+            while cursor + header_size <= file_len {
+                source.file.seek(SeekFrom::Start(cursor))?;
+
+                let mut header_bytes = [0u8; size_of::<BlobEntryHeader>()];
+                if source.file.read_exact(&mut header_bytes).is_err() {
+                    break; // End of file or partial write
+                }
+
+                let header: &BlobEntryHeader = bytemuck::from_bytes(&header_bytes);
+
+                if header.magic != MAGIC_NUMBER {
+                    let next_page = align_to_page(cursor + 1, page_size);
+                    if next_page >= file_len {
+                        break;
+                    }
+                    cursor = next_page;
+                    continue;
+                }
+
+                let entry_footprint =
+                    align_to_page(header_size + header.data_len as u64, page_size);
+                let current_pos = new_blob.file.stream_position()?;
+
+                if current_pos + entry_footprint > threshold {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Compaction overflow: blob {} reached threshold", new_id),
+                    ));
+                }
+
+                opt_data.resize(header.data_len as usize, 0);
+                source.file.read_exact(&mut opt_data)?;
+
+                if header.checksum == Hasher::hash(&opt_data) {
+                    let new_offset = new_blob.ingest(header.object_id, &opt_data)?;
+                    mappings.push(OffsetMap {
+                        object_id: header.object_id,
+                        old_blob_id: source.id,
+                        old_offset: cursor,
+                        new_offset,
+                    });
+                }
+
+                let entry_total_size = size_of::<BlobEntryHeader>() as u64 + header.data_len as u64;
+                cursor = align_to_page(cursor + entry_total_size, page_size);
+            }
+        }
+
+        let sealed_blob = new_blob.seal(&base_dir)?;
+
+        let opt_blob = Blob {
+            id: sealed_blob.id,
+            path: sealed_blob.path,
+            file: sealed_blob.file,
+            page_size: sealed_blob.page_size,
+            threshold: sealed_blob.threshold,
+            state: Optimized { mappings },
+        };
+
+        Ok(CompactedBlob {
+            new_blob: opt_blob,
+            removed_blob_ids: removed_ids,
         })
     }
 }
@@ -244,16 +371,16 @@ impl Blob<Sealed> {
 struct Hasher;
 
 impl Hasher {
-    fn hash(data_len: usize, data: &[u8]) -> u32 {
+    fn hash(data: &[u8]) -> u32 {
         let mut hasher = crc32fast::Hasher::new();
-        hasher.update(&(data_len as u32).to_le_bytes());
+        hasher.update(&(data.len() as u32).to_le_bytes());
         hasher.update(data);
         hasher.finalize()
     }
 }
 
 #[inline(always)]
-const fn align_to_page(size: u64) -> u64 {
-    let page_mask = PAGE_SIZE - 1;
+const fn align_to_page(size: u64, page_size: u64) -> u64 {
+    let page_mask = page_size - 1;
     (size + page_mask) & !page_mask
 }
