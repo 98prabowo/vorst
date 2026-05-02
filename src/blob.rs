@@ -12,8 +12,10 @@ use crate::sys::preallocate;
 
 const BLOB_THRESHOLD: u64 = 2 * 1024 * 1024 * 1024;
 const MAGIC_NUMBER: u32 = 0xDEADBEEF;
-const PAGE_SIZE: u64 = 4096;
+const PAGE_SIZE: u64 = 4 * 1024;
 const SHARD_COUNT: u64 = 100;
+const INITIAL_IO_BUFFER_SIZE: usize = 1024 * 1024;
+const HEADER_SIZE: u64 = size_of::<BlobEntryHeader>() as u64;
 
 // MARK: - Models
 
@@ -27,7 +29,12 @@ pub struct BlobEntryHeader {
     _padding: u32,
 }
 
-pub struct OffsetMap {
+pub struct ObjectOffset {
+    pub object_id: u64,
+    pub offset: u64,
+}
+
+pub struct CompactionMap {
     pub object_id: u64,
     pub old_blob_id: u64,
     pub old_offset: u64,
@@ -35,7 +42,7 @@ pub struct OffsetMap {
 }
 
 pub struct CompactedBlob {
-    pub new_blob: Blob<Optimized>,
+    pub new_blob: Blob<Compacted>,
     pub removed_blob_ids: Vec<u64>,
 }
 
@@ -45,13 +52,13 @@ pub trait BlobState {}
 
 pub struct Active;
 pub struct Sealed;
-pub struct Optimized {
-    pub mappings: Vec<OffsetMap>,
+pub struct Compacted {
+    pub mappings: Vec<CompactionMap>,
 }
 
 impl BlobState for Active {}
 impl BlobState for Sealed {}
-impl BlobState for Optimized {}
+impl BlobState for Compacted {}
 
 // MARK: - Storage
 
@@ -79,9 +86,8 @@ impl<S: BlobState> Blob<S> {
 
     pub fn read_entry(&mut self, offset: u64) -> io::Result<(BlobEntryHeader, Vec<u8>)> {
         let file_len = self.file.metadata()?.len();
-        let header_size = size_of::<BlobEntryHeader>() as u64;
 
-        if offset + header_size > file_len {
+        if offset + HEADER_SIZE > file_len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "offset out of bounds",
@@ -102,7 +108,7 @@ impl<S: BlobState> Blob<S> {
             ));
         }
 
-        if offset + header_size + header.data_len as u64 > file_len {
+        if offset + HEADER_SIZE + header.data_len as u64 > file_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "header claims more data than file contains",
@@ -128,11 +134,11 @@ impl Blob<Active> {
     where
         P: AsRef<Path>,
     {
-        let shard_dir = Self::compute_shard_path(base_dir, id);
-        fs::create_dir_all(&shard_dir)?;
+        let active_dir = Self::compute_shard_path(base_dir, id);
+        fs::create_dir_all(&active_dir)?;
 
         let filename = format!("v-{0:16}.blob.tmp", id);
-        let path = shard_dir.join(filename);
+        let path = active_dir.join(filename);
 
         let file = OpenOptions::new()
             .read(true)
@@ -155,8 +161,8 @@ impl Blob<Active> {
     pub fn ingest(&mut self, id: u64, data: &[u8]) -> io::Result<u64> {
         let offset = self.file.stream_position()?;
 
-        let total_len = size_of::<BlobEntryHeader>() + data.len();
-        let padded_len = align_to_page(total_len as u64, self.page_size) as usize;
+        let total_len = HEADER_SIZE + data.len() as u64;
+        let padded_len = align_to_page(total_len, self.page_size) as usize;
 
         if offset + padded_len as u64 > self.threshold {
             return Err(io::Error::new(
@@ -198,19 +204,19 @@ impl Blob<Active> {
         self.file.set_len(final_size)?; // Trim preallocation
         self.file.sync_all()?;
 
-        let shard_dir = Self::compute_shard_path(base_dir, self.id);
-        fs::create_dir_all(&shard_dir)?;
+        let sealed_dir = Self::compute_shard_path(base_dir, self.id);
+        fs::create_dir_all(&sealed_dir)?;
 
         let file_name = self
             .path
             .file_stem()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
-        let sealed_path = shard_dir.join(file_name);
+        let sealed_path = sealed_dir.join(file_name);
 
         fs::rename(&self.path, &sealed_path)?;
         let file = File::open(&sealed_path)?;
 
-        let dir = File::open(&shard_dir)?;
+        let dir = File::open(&sealed_dir)?;
         dir.sync_all()?;
 
         Ok(Blob {
@@ -225,13 +231,12 @@ impl Blob<Active> {
 }
 
 impl Blob<Sealed> {
-    pub fn scan_offsets(&mut self) -> io::Result<Vec<(u64, u64)>> {
+    pub fn scan_offsets(&mut self) -> io::Result<Vec<ObjectOffset>> {
         let mut index = Vec::new();
-        let header_size = size_of::<BlobEntryHeader>() as u64;
         let file_len = self.file.metadata()?.len();
         let mut cursor = 0;
 
-        while cursor + header_size <= file_len {
+        while cursor + HEADER_SIZE <= file_len {
             self.file.seek(SeekFrom::Start(cursor))?;
 
             let mut header_bytes = [0u8; size_of::<BlobEntryHeader>()];
@@ -250,12 +255,15 @@ impl Blob<Sealed> {
                 continue;
             }
 
-            let total_entry_size = header_size + header.data_len as u64;
+            let total_entry_size = HEADER_SIZE + header.data_len as u64;
             if cursor + total_entry_size > file_len {
                 break; // Corrupted header claims more data than exists.
             }
 
-            index.push((header.object_id, cursor));
+            index.push(ObjectOffset {
+                object_id: header.object_id,
+                offset: cursor,
+            });
             cursor = align_to_page(cursor + total_entry_size, self.page_size);
         }
 
@@ -292,15 +300,14 @@ impl BlobCompactable for Vec<Blob<Sealed>> {
         let mut mappings = Vec::new();
         let mut removed_ids = Vec::new();
 
-        let mut opt_data = Vec::with_capacity(1024 * 1024);
-        let header_size = size_of::<BlobEntryHeader>() as u64;
+        let mut io_buf = Vec::with_capacity(INITIAL_IO_BUFFER_SIZE);
 
         for mut source in self {
             let file_len = source.file.metadata()?.len();
             let mut cursor = 0;
             removed_ids.push(source.id);
 
-            while cursor + header_size <= file_len {
+            while cursor + HEADER_SIZE <= file_len {
                 source.file.seek(SeekFrom::Start(cursor))?;
 
                 let mut header_bytes = [0u8; size_of::<BlobEntryHeader>()];
@@ -320,7 +327,7 @@ impl BlobCompactable for Vec<Blob<Sealed>> {
                 }
 
                 let entry_footprint =
-                    align_to_page(header_size + header.data_len as u64, page_size);
+                    align_to_page(HEADER_SIZE + header.data_len as u64, page_size);
                 let current_pos = new_blob.file.stream_position()?;
 
                 if current_pos + entry_footprint > threshold {
@@ -330,12 +337,18 @@ impl BlobCompactable for Vec<Blob<Sealed>> {
                     ));
                 }
 
-                opt_data.resize(header.data_len as usize, 0);
-                source.file.read_exact(&mut opt_data)?;
+                let data_len = header.data_len as usize;
+                if data_len > io_buf.capacity() {
+                    io_buf.reserve(data_len - io_buf.capacity());
+                }
+                io_buf.clear();
 
-                if header.checksum == Hasher::hash(&opt_data) {
-                    let new_offset = new_blob.ingest(header.object_id, &opt_data)?;
-                    mappings.push(OffsetMap {
+                let mut reader = (&mut source.file).take(data_len as u64);
+                reader.read_to_end(&mut io_buf)?;
+
+                if header.checksum == Hasher::hash(&io_buf) {
+                    let new_offset = new_blob.ingest(header.object_id, &io_buf)?;
+                    mappings.push(CompactionMap {
                         object_id: header.object_id,
                         old_blob_id: source.id,
                         old_offset: cursor,
@@ -343,7 +356,7 @@ impl BlobCompactable for Vec<Blob<Sealed>> {
                     });
                 }
 
-                let entry_total_size = size_of::<BlobEntryHeader>() as u64 + header.data_len as u64;
+                let entry_total_size = HEADER_SIZE + header.data_len as u64;
                 cursor = align_to_page(cursor + entry_total_size, page_size);
             }
         }
@@ -356,7 +369,7 @@ impl BlobCompactable for Vec<Blob<Sealed>> {
             file: sealed_blob.file,
             page_size: sealed_blob.page_size,
             threshold: sealed_blob.threshold,
-            state: Optimized { mappings },
+            state: Compacted { mappings },
         };
 
         Ok(CompactedBlob {
