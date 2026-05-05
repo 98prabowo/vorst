@@ -2037,6 +2037,7 @@ dependencies = [
  "candle-core",
  "chrono",
  "crc32fast",
+ "libc",
  "memmap2",
  "ndarray",
  "nix",
