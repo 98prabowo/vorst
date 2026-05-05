@@ -148,46 +148,13 @@ impl<S: BlobState> Blob<S> {
 
         Ok((header, data))
     }
-}
-
-impl<S: ImmutableBlob> Blob<S> {
-    pub fn open_readonly<P>(path: P, page_size: u64) -> io::Result<Self>
-    where
-        P: AsRef<Path>,
-    {
-        let path_buf = path.as_ref().to_path_buf();
-
-        // Logic to extract ID from filename (stripping ".blob")
-        let filename = path_buf
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
-
-        let id_str = filename
-            .strip_prefix(BLOB_PREFIX)
-            .and_then(|s| s.split(".").next())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "filename format mismatch")
-            })?;
-
-        let id = Uuid::parse_str(id_str)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UUID"))?;
-
-        let file = File::open(&path_buf)?;
-
-        Ok(Self {
-            id,
-            path: path_buf,
-            file,
-            page_size,
-            state: S::default(),
-        })
-    }
 
     pub fn scan_offsets(&mut self) -> io::Result<Vec<ObjectOffset>> {
         let mut index = Vec::new();
         let file_len = self.file.metadata()?.len();
         let mut cursor = 0;
+
+        self.file.seek(SeekFrom::Start(0))?;
 
         while cursor + HEADER_SIZE <= file_len {
             self.file.seek(SeekFrom::Start(cursor))?;
@@ -222,6 +189,41 @@ impl<S: ImmutableBlob> Blob<S> {
         }
 
         Ok(index)
+    }
+}
+
+impl<S: ImmutableBlob> Blob<S> {
+    pub fn open_readonly<P>(path: P, page_size: u64) -> io::Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        let path_buf = path.as_ref().to_path_buf();
+
+        // Logic to extract ID from filename (stripping ".blob")
+        let filename = path_buf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
+
+        let id_str = filename
+            .strip_prefix(BLOB_PREFIX)
+            .and_then(|s| s.split(".").next())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "filename format mismatch")
+            })?;
+
+        let id = Uuid::parse_str(id_str)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UUID"))?;
+
+        let file = File::open(&path_buf)?;
+
+        Ok(Self {
+            id,
+            path: path_buf,
+            file,
+            page_size,
+            state: S::default(),
+        })
     }
 }
 
