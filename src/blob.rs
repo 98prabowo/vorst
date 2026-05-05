@@ -56,10 +56,16 @@ pub struct CompactedBlob {
 // MARK: - State Machine
 
 pub trait BlobState {}
-pub trait ImmutableBlob: BlobState {}
+pub trait ImmutableBlob: BlobState + Default {}
 
-pub struct Active;
+pub struct Active {
+    threshold: u64,
+}
+
+#[derive(Default)]
 pub struct Sealed;
+
+#[derive(Default)]
 pub struct Compacted {
     pub mappings: Vec<CompactionMap>,
 }
@@ -78,7 +84,6 @@ pub struct Blob<S: BlobState> {
     path: PathBuf,
     file: File,
     page_size: u64,
-    threshold: u64,
     pub state: S,
 }
 
@@ -146,6 +151,39 @@ impl<S: BlobState> Blob<S> {
 }
 
 impl<S: ImmutableBlob> Blob<S> {
+    pub fn open_readonly<P>(path: P, page_size: u64) -> io::Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        let path_buf = path.as_ref().to_path_buf();
+
+        // Logic to extract ID from filename (stripping ".blob")
+        let filename = path_buf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
+
+        let id_str = filename
+            .strip_prefix(BLOB_PREFIX)
+            .and_then(|s| s.split(".").next())
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "filename format mismatch")
+            })?;
+
+        let id = Uuid::parse_str(id_str)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UUID"))?;
+
+        let file = File::open(&path_buf)?;
+
+        Ok(Self {
+            id,
+            path: path_buf,
+            file,
+            page_size,
+            state: S::default(),
+        })
+    }
+
     pub fn scan_offsets(&mut self) -> io::Result<Vec<ObjectOffset>> {
         let mut index = Vec::new();
         let file_len = self.file.metadata()?.len();
@@ -212,8 +250,40 @@ impl Blob<Active> {
             path,
             file,
             page_size,
-            threshold,
-            state: Active,
+            state: Active { threshold },
+        })
+    }
+
+    pub fn open<P>(path: P, threshold: u64, page_size: u64) -> io::Result<Self>
+    where
+        P: AsRef<Path>,
+    {
+        let path_buf = path.as_ref().to_path_buf();
+
+        let filename = path_buf
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
+
+        let id_str = filename
+            .strip_prefix(BLOB_PREFIX)
+            .and_then(|s| s.strip_suffix(format!("{}.tmp", BLOB_EXTENSION).as_str()))
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "filename format mismatch")
+            })?;
+
+        let id = Uuid::parse_str(id_str)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UUID in filename"))?;
+
+        let mut file = OpenOptions::new().read(true).append(true).open(&path_buf)?;
+        file.seek(SeekFrom::End(0))?;
+
+        Ok(Self {
+            id,
+            path: path_buf,
+            file,
+            page_size,
+            state: Active { threshold },
         })
     }
 
@@ -231,12 +301,12 @@ impl Blob<Active> {
         let total_len = HEADER_SIZE + data.len() as u64;
         let padded_len = align_to_page(total_len, self.page_size) as usize;
 
-        if offset + padded_len as u64 > self.threshold {
+        if offset + padded_len as u64 > self.state.threshold {
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
                 format!(
                     "blob capacity reached. offset {} + needed {} > threshold {}",
-                    offset, padded_len, self.threshold
+                    offset, padded_len, self.state.threshold
                 ),
             ));
         }
@@ -288,7 +358,6 @@ impl Blob<Active> {
             path: sealed_path,
             file,
             page_size: self.page_size,
-            threshold: self.threshold,
             state: Sealed,
         })
     }
@@ -405,7 +474,6 @@ impl<S: ImmutableBlob> BlobCompactable for Vec<Blob<S>> {
                 path: sealed_blob.path,
                 file: sealed_blob.file,
                 page_size: sealed_blob.page_size,
-                threshold: sealed_blob.threshold,
                 state: Compacted { mappings },
             },
             removed_blob_ids: removed_ids,
