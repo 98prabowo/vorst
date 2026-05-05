@@ -33,4 +33,4 @@ crc32fast   = "1.5"
 chrono      = "0.4"
 libc        = "0.2"
 tracing     = "0.1"
-uuid        = { version = "1.23", features = ["v4", "serde"] }
+uuid        = { version = "1.23", features = ["v7", "serde"] }

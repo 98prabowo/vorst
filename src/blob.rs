@@ -5,14 +5,15 @@ use std::{
 };
 
 use bytemuck::{Pod, Zeroable};
+use uuid::Uuid;
 
 use crate::sys::preallocate;
 
 // MARK: - Constants
 
-const BLOB_THRESHOLD: u64 = 2 * 1024 * 1024 * 1024;
-const MAGIC_NUMBER: u32 = 0xDEADBEEF;
-const SHARD_COUNT: u64 = 100;
+const BLOB_PREFIX: &str = "vb-";
+const BLOB_EXTENSION: &str = ".blob";
+const MAGIC_NUMBER: u32 = 0x56424c42; // "VBLB"
 const INITIAL_IO_BUFFER_SIZE: usize = 1024 * 1024;
 const HEADER_SIZE: u64 = size_of::<BlobEntryHeader>() as u64;
 
@@ -35,14 +36,14 @@ pub struct ObjectOffset {
 
 pub struct CompactionMap {
     pub object_id: u64,
-    pub old_blob_id: u64,
+    pub old_blob_id: Uuid,
     pub old_offset: u64,
     pub new_offset: u64,
 }
 
 pub struct CompactedBlob {
     pub new_blob: Blob<Compacted>,
-    pub removed_blob_ids: Vec<u64>,
+    pub removed_blob_ids: Vec<Uuid>,
 }
 
 // MARK: - State Machine
@@ -62,7 +63,7 @@ impl BlobState for Compacted {}
 // MARK: - Storage
 
 pub struct Blob<S: BlobState> {
-    id: u64,
+    id: Uuid,
     path: PathBuf,
     file: File,
     page_size: u64,
@@ -71,16 +72,21 @@ pub struct Blob<S: BlobState> {
 }
 
 impl<S: BlobState> Blob<S> {
-    pub fn id(&self) -> u64 {
+    pub fn id(&self) -> Uuid {
         self.id
     }
 
-    pub fn compute_shard_path<P>(base_dir: P, blob_id: u64) -> PathBuf
+    pub fn compute_shard_path<P>(base_dir: P, id: Uuid) -> PathBuf
     where
         P: AsRef<Path>,
     {
-        let shard = blob_id % SHARD_COUNT;
-        base_dir.as_ref().join(format!("{:02}", shard))
+        let uuid_str = id.to_string();
+        let shard = &uuid_str[uuid_str.len() - 2..];
+        base_dir.as_ref().join(shard)
+    }
+
+    pub fn generate_filename(uuid: &Uuid) -> String {
+        format!("{}{}{}", BLOB_PREFIX, uuid, BLOB_EXTENSION)
     }
 
     pub fn read_entry(&mut self, offset: u64) -> io::Result<(BlobEntryHeader, Vec<u8>)> {
@@ -129,15 +135,16 @@ impl<S: BlobState> Blob<S> {
 }
 
 impl Blob<Active> {
-    pub fn new<P>(id: u64, base_dir: P, threshold: u64, page_size: u64) -> io::Result<Self>
+    pub fn new<P>(base_dir: P, threshold: u64, page_size: u64) -> io::Result<Self>
     where
         P: AsRef<Path>,
     {
+        let id = Uuid::now_v7();
         let active_dir = Self::compute_shard_path(base_dir, id);
         fs::create_dir_all(&active_dir)?;
 
-        let filename = format!("v-{0:16}.blob.tmp", id);
-        let path = active_dir.join(filename);
+        let filename = Self::generate_filename(&id);
+        let path = active_dir.join(format!("{filename}.tmp"));
 
         let file = OpenOptions::new()
             .read(true)
@@ -189,10 +196,6 @@ impl Blob<Active> {
         self.file.write_all(&entry)?;
 
         Ok(offset)
-    }
-
-    pub fn flush(&self) -> io::Result<()> {
-        self.file.sync_data()
     }
 
     pub fn seal<P>(mut self, base_dir: P) -> io::Result<Blob<Sealed>>
@@ -273,37 +276,26 @@ impl Blob<Sealed> {
 // MARK: - Compaction
 
 pub trait BlobCompactable {
-    fn compact<P>(
-        self,
-        base_dir: P,
-        threshold: u64,
-        page_size: u64,
-        new_id: u64,
-    ) -> io::Result<CompactedBlob>
+    fn compact<P>(self, base_dir: P, threshold: u64, page_size: u64) -> io::Result<CompactedBlob>
     where
         P: AsRef<Path>;
 }
 
 impl BlobCompactable for Vec<Blob<Sealed>> {
-    fn compact<P>(
-        self,
-        base_dir: P,
-        threshold: u64,
-        page_size: u64,
-        new_id: u64,
-    ) -> io::Result<CompactedBlob>
+    fn compact<P>(self, base_dir: P, threshold: u64, page_size: u64) -> io::Result<CompactedBlob>
     where
         P: AsRef<Path>,
     {
-        let mut new_blob = Blob::<Active>::new(new_id, &base_dir, threshold, page_size)?;
+        let mut new_blob = Blob::<Active>::new(&base_dir, threshold, page_size)?;
+
         let mut mappings = Vec::new();
         let mut removed_ids = Vec::new();
-
         let mut io_buf = Vec::with_capacity(INITIAL_IO_BUFFER_SIZE);
 
         for mut source in self {
             let file_len = source.file.metadata()?.len();
             let mut cursor = 0;
+
             removed_ids.push(source.id);
 
             while cursor + HEADER_SIZE <= file_len {
@@ -332,7 +324,10 @@ impl BlobCompactable for Vec<Blob<Sealed>> {
                 if current_pos + entry_footprint > threshold {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
-                        format!("Compaction overflow: blob {} reached threshold", new_id),
+                        format!(
+                            "Compaction overflow: blob {} reached threshold",
+                            new_blob.id
+                        ),
                     ));
                 }
 
@@ -362,17 +357,15 @@ impl BlobCompactable for Vec<Blob<Sealed>> {
 
         let sealed_blob = new_blob.seal(&base_dir)?;
 
-        let opt_blob = Blob {
-            id: sealed_blob.id,
-            path: sealed_blob.path,
-            file: sealed_blob.file,
-            page_size: sealed_blob.page_size,
-            threshold: sealed_blob.threshold,
-            state: Compacted { mappings },
-        };
-
         Ok(CompactedBlob {
-            new_blob: opt_blob,
+            new_blob: Blob {
+                id: sealed_blob.id,
+                path: sealed_blob.path,
+                file: sealed_blob.file,
+                page_size: sealed_blob.page_size,
+                threshold: sealed_blob.threshold,
+                state: Compacted { mappings },
+            },
             removed_blob_ids: removed_ids,
         })
     }
