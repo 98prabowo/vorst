@@ -12,7 +12,6 @@ use crate::sys::preallocate;
 
 const BLOB_THRESHOLD: u64 = 2 * 1024 * 1024 * 1024;
 const MAGIC_NUMBER: u32 = 0xDEADBEEF;
-const PAGE_SIZE: u64 = 4 * 1024;
 const SHARD_COUNT: u64 = 100;
 const INITIAL_IO_BUFFER_SIZE: usize = 1024 * 1024;
 const HEADER_SIZE: u64 = size_of::<BlobEntryHeader>() as u64;
