@@ -241,8 +241,7 @@ impl Blob<Active> {
             )
         })?;
 
-        // TODO: Add intended file threshold at file header
-        let header = FileHeader::new(id, 0, now);
+        let header = FileHeader::new(id, 0, threshold, now);
         file.write_all_at(bytemuck::bytes_of(&header), 0)?;
 
         preallocate(&file, threshold)?;
@@ -302,7 +301,7 @@ impl Blob<Active> {
         let file_header: &FileHeader = bytemuck::from_bytes(&file_header_bytes.0);
         file_header.validate(id)?;
 
-        let threshold = file.metadata()?.len();
+        let threshold = file_header.threshold();
         let created_at = file_header.created_at()?;
 
         let mut blob = Self {

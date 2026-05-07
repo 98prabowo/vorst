@@ -13,28 +13,34 @@ pub const OBJECT_HEADER_SIZE: u64 = size_of::<ObjectHeader>() as u64;
 pub struct FileHeader {
     magic: u32,
     version: u32,
+    threshold: u64,
     created_at: i64,
     sealed_at: i64,
-    blob_id: [u8; 16],
     entries_count: u32,
+    blob_id: [u8; 16],
     _padding: [u8; 4],
 }
 
 impl FileHeader {
-    pub fn new(id: Uuid, count: u32, created_at: DateTime<Utc>) -> Self {
+    pub fn new(id: Uuid, count: u32, threshold: u64, created_at: DateTime<Utc>) -> Self {
         Self {
             magic: BLOB_MAGIC.to_le(),
             version: 1u32.to_le(),
+            threshold: threshold.to_le(),
             created_at: created_at.timestamp().to_le(),
             sealed_at: 0,
-            blob_id: id.into_bytes(),
             entries_count: count.to_le(),
+            blob_id: id.into_bytes(),
             _padding: [0u8; 4],
         }
     }
 
     pub fn magic(&self) -> u32 {
         u32::from_le(self.magic)
+    }
+
+    pub fn threshold(&self) -> u64 {
+        u64::from_le(self.threshold)
     }
 
     pub fn created_at(&self) -> io::Result<DateTime<Utc>> {
@@ -47,12 +53,12 @@ impl FileHeader {
         i64::from_le(self.sealed_at)
     }
 
-    pub fn blob_id(&self) -> Uuid {
-        Uuid::from_bytes(self.blob_id)
-    }
-
     pub fn entries_count(&self) -> u32 {
         u32::from_le(self.entries_count)
+    }
+
+    pub fn blob_id(&self) -> Uuid {
+        Uuid::from_bytes(self.blob_id)
     }
 
     pub fn validate(&self, id: Uuid) -> io::Result<()> {
