@@ -6,6 +6,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
+use fs2::FileExt as Fs2FileExt;
 use uuid::Uuid;
 
 use crate::{
@@ -185,6 +186,13 @@ impl<S: ImmutableBlob> Blob<S> {
 
         let file = File::open(&path_buf)?;
 
+        file.try_lock_shared().map_err(|_| {
+            io::Error::other(format!(
+                "Could not acquire shared lock on blob: {:?}",
+                path_buf
+            ))
+        })?;
+
         let mut file_header_bytes = AlignedBuffer([0u8; size_of::<FileHeader>()]);
         file.read_exact_at(&mut file_header_bytes.0, 0)?;
 
@@ -226,11 +234,24 @@ impl Blob<Active> {
             .truncate(true)
             .open(&path)?;
 
+        file.try_lock_exclusive().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("Blob is already locked by another process: {:?}", path),
+            )
+        })?;
+
+        // TODO: Add intended file threshold at file header
         let header = FileHeader::new(id, 0, now);
         file.write_all_at(bytemuck::bytes_of(&header), 0)?;
-        file.sync_all()?;
 
         preallocate(&file, threshold)?;
+        file.sync_all()?;
+
+        if let Some(parent) = path.parent() {
+            let dir = File::open(parent)?;
+            dir.sync_all()?;
+        }
 
         Ok(Self {
             id,
@@ -268,6 +289,13 @@ impl Blob<Active> {
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UUID in filename"))?;
 
         let file = OpenOptions::new().read(true).write(true).open(&path_buf)?;
+
+        file.try_lock_exclusive().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AddrInUse,
+                format!("Blob is already locked by another process: {:?}", path_buf),
+            )
+        })?;
 
         let mut file_header_bytes = AlignedBuffer([0u8; size_of::<FileHeader>()]);
         file.read_exact_at(&mut file_header_bytes.0, 0)?;
@@ -381,22 +409,22 @@ impl Blob<Active> {
         let sealed_dir = Self::compute_shard_path(base_dir, self.id);
         fs::create_dir_all(&sealed_dir)?;
 
-        let file_name = self
-            .path
-            .file_stem()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
+        let file_name = Self::generate_filename(&self.id);
         let sealed_path = sealed_dir.join(file_name);
 
         fs::rename(&self.path, &sealed_path)?;
-        let file = File::open(&sealed_path)?;
 
         let dir = File::open(&sealed_dir)?;
         dir.sync_all()?;
 
+        if let Err(e) = self.file.lock_shared() {
+            eprintln!("Lock downgrade for blob {} returned: {}.", self.id, e);
+        }
+
         Ok(Blob {
             id: self.id,
             path: sealed_path,
-            file,
+            file: self.file,
             page_size: self.page_size,
             created_at: self.created_at,
             state: Sealed,
