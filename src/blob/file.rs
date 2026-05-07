@@ -1,6 +1,7 @@
 use std::{
     fs::{self, File, OpenOptions},
     io,
+    ops::{Deref, DerefMut},
     os::unix::fs::FileExt,
     path::{Path, PathBuf},
 };
@@ -11,7 +12,7 @@ use uuid::Uuid;
 
 use crate::{
     blob::{
-        format::{FileHeader, OBJECT_HEADER_SIZE, OBJECT_MAGIC, ObjectHeader},
+        format::{FILE_HEADER_SIZE, FileHeader, OBJECT_HEADER_SIZE, OBJECT_MAGIC, ObjectHeader},
         state::{Active, BlobState, ImmutableBlob, Sealed},
         types::ObjectOffset,
     },
@@ -66,18 +67,17 @@ impl<S: BlobState> Blob<S> {
 
         let file_len = self.file.metadata()?.len();
 
-        if offset + OBJECT_HEADER_SIZE > file_len {
+        if offset + OBJECT_HEADER_SIZE as u64 > file_len {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "offset out of bounds",
             ));
         }
 
-        let mut object_header_bytes = AlignedBuffer([0u8; OBJECT_HEADER_SIZE as usize]);
-        self.file
-            .read_exact_at(&mut object_header_bytes.0, offset)?;
+        let mut object_header_bytes = AlignedBuffer::<OBJECT_HEADER_SIZE>::default();
+        self.file.read_exact_at(&mut *object_header_bytes, offset)?;
 
-        let object_header: ObjectHeader = *bytemuck::from_bytes(&object_header_bytes.0);
+        let object_header: ObjectHeader = *bytemuck::from_bytes(&*object_header_bytes);
 
         if object_header.magic() != OBJECT_MAGIC {
             return Err(io::Error::new(
@@ -95,7 +95,7 @@ impl<S: BlobState> Blob<S> {
 
         let mut data = vec![0u8; object_header.data_len() as usize];
         self.file
-            .read_exact_at(&mut data, offset + OBJECT_HEADER_SIZE)?;
+            .read_exact_at(&mut data, offset + OBJECT_HEADER_SIZE as u64)?;
 
         if object_header.checksum() != Hasher::hash(&data) {
             return Err(io::Error::new(
@@ -120,23 +120,23 @@ impl<S: BlobState> Blob<S> {
         let file_len = self.file.metadata()?.len();
         let mut cursor = self.page_size;
 
-        let mut file_header_bytes = AlignedBuffer([0u8; size_of::<FileHeader>()]);
-        self.file.read_exact_at(&mut file_header_bytes.0, 0)?;
+        let mut file_header_bytes = AlignedBuffer::<FILE_HEADER_SIZE>::default();
+        self.file.read_exact_at(&mut *file_header_bytes, 0)?;
 
-        let file_header: &FileHeader = bytemuck::from_bytes(&file_header_bytes.0);
+        let file_header: &FileHeader = bytemuck::from_bytes(&*file_header_bytes);
         file_header.validate(self.id)?;
 
-        while cursor + OBJECT_HEADER_SIZE <= file_len {
-            let mut object_header_bytes = AlignedBuffer([0u8; size_of::<ObjectHeader>()]);
+        while cursor + OBJECT_HEADER_SIZE as u64 <= file_len {
+            let mut object_header_bytes = AlignedBuffer::<OBJECT_HEADER_SIZE>::default();
             if self
                 .file
-                .read_exact_at(&mut object_header_bytes.0, cursor)
+                .read_exact_at(&mut *object_header_bytes, cursor)
                 .is_err()
             {
                 break;
             }
 
-            let object_header: &ObjectHeader = bytemuck::from_bytes(&object_header_bytes.0);
+            let object_header: &ObjectHeader = bytemuck::from_bytes(&*object_header_bytes);
 
             if object_header.magic() != OBJECT_MAGIC {
                 let next_page = align_to_page(cursor + 1, self.page_size);
@@ -194,10 +194,10 @@ impl<S: ImmutableBlob> Blob<S> {
             ))
         })?;
 
-        let mut file_header_bytes = AlignedBuffer([0u8; size_of::<FileHeader>()]);
-        file.read_exact_at(&mut file_header_bytes.0, 0)?;
+        let mut file_header_bytes = AlignedBuffer::<FILE_HEADER_SIZE>::default();
+        file.read_exact_at(&mut *file_header_bytes, 0)?;
 
-        let file_header: &FileHeader = bytemuck::from_bytes(&file_header_bytes.0);
+        let file_header: &FileHeader = bytemuck::from_bytes(&*file_header_bytes);
         file_header.validate(id)?;
 
         let created_at = file_header.created_at()?;
@@ -297,9 +297,9 @@ impl Blob<Active> {
             )
         })?;
 
-        let mut file_header_bytes = AlignedBuffer([0u8; size_of::<FileHeader>()]);
-        file.read_exact_at(&mut file_header_bytes.0, 0)?;
-        let file_header: &FileHeader = bytemuck::from_bytes(&file_header_bytes.0);
+        let mut file_header_bytes = AlignedBuffer::<FILE_HEADER_SIZE>::default();
+        file.read_exact_at(&mut *file_header_bytes, 0)?;
+        let file_header: &FileHeader = bytemuck::from_bytes(&*file_header_bytes);
         file_header.validate(id)?;
 
         let capacity = file_header.capacity();
@@ -321,11 +321,11 @@ impl Blob<Active> {
         let object_offsets = blob.scan_offsets()?;
 
         if let Some(last_object) = object_offsets.last() {
-            let mut object_header_bytes = AlignedBuffer([0u8; size_of::<ObjectHeader>()]);
+            let mut object_header_bytes = AlignedBuffer::<OBJECT_HEADER_SIZE>::default();
             blob.file
-                .read_exact_at(&mut object_header_bytes.0, last_object.offset)?;
+                .read_exact_at(&mut *object_header_bytes, last_object.offset)?;
 
-            let object_header: &ObjectHeader = bytemuck::from_bytes(&object_header_bytes.0);
+            let object_header: &ObjectHeader = bytemuck::from_bytes(&*object_header_bytes);
 
             let next_pos =
                 align_to_page(last_object.offset + object_header.object_size(), page_size);
@@ -356,7 +356,7 @@ impl Blob<Active> {
 
         let offset = self.state.write_cursor;
 
-        let total_len = OBJECT_HEADER_SIZE + data.len() as u64;
+        let total_len = OBJECT_HEADER_SIZE as u64 + data.len() as u64;
         let padded_len = align_to_page(total_len, self.page_size) as usize;
 
         if offset + padded_len as u64 > self.state.capacity {
@@ -452,12 +452,12 @@ impl<'a, S: ImmutableBlob> Iterator for ObjectIterator<'a, S> {
     type Item = io::Result<(u64, ObjectHeader)>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while self.cursor + OBJECT_HEADER_SIZE <= self.file_len {
-            let mut header_bytes = AlignedBuffer([0u8; size_of::<ObjectHeader>()]);
+        while self.cursor + OBJECT_HEADER_SIZE as u64 <= self.file_len {
+            let mut header_bytes = AlignedBuffer::<OBJECT_HEADER_SIZE>::default();
             if let Err(e) = self
                 .blob
                 .file
-                .read_exact_at(&mut header_bytes.0, self.cursor)
+                .read_exact_at(&mut *header_bytes, self.cursor)
             {
                 if e.kind() == io::ErrorKind::UnexpectedEof {
                     return None;
@@ -465,7 +465,7 @@ impl<'a, S: ImmutableBlob> Iterator for ObjectIterator<'a, S> {
                 return Some(Err(e));
             }
 
-            let header: ObjectHeader = *bytemuck::from_bytes(&header_bytes.0);
+            let header: ObjectHeader = *bytemuck::from_bytes(&*header_bytes);
             let offset = self.cursor;
 
             if header.magic() != OBJECT_MAGIC {
@@ -478,7 +478,7 @@ impl<'a, S: ImmutableBlob> Iterator for ObjectIterator<'a, S> {
                 continue;
             }
 
-            let entry_size = OBJECT_HEADER_SIZE + header.data_len() as u64;
+            let entry_size = OBJECT_HEADER_SIZE as u64 + header.data_len() as u64;
             let entry_footprint = align_to_page(entry_size, self.blob.page_size);
             self.cursor += entry_footprint;
 
@@ -502,6 +502,26 @@ impl Hasher {
 
 #[repr(align(8))]
 pub struct AlignedBuffer<const N: usize>(pub [u8; N]);
+
+impl<const N: usize> Default for AlignedBuffer<N> {
+    fn default() -> Self {
+        Self([0u8; N])
+    }
+}
+
+impl<const N: usize> Deref for AlignedBuffer<N> {
+    type Target = [u8; N];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<const N: usize> DerefMut for AlignedBuffer<N> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 
 #[inline(always)]
 pub const fn align_to_page(size: u64, page_size: u64) -> u64 {

@@ -4,7 +4,7 @@ use uuid::Uuid;
 
 use crate::blob::{
     file::{AlignedBuffer, Blob, FLAG_TOMBSTONE, Hasher},
-    format::{FileHeader, OBJECT_HEADER_SIZE},
+    format::{FILE_HEADER_SIZE, FileHeader, OBJECT_HEADER_SIZE},
     state::{Active, Compacted, ImmutableBlob},
     types::{CompactedBlob, CompactionMap},
 };
@@ -52,9 +52,9 @@ impl<S: ImmutableBlob> BlobCompactable for Vec<Blob<S>> {
         // into the new blob using an ordered writer.
 
         for source in self {
-            let mut file_header_bytes = AlignedBuffer([0u8; size_of::<FileHeader>()]);
-            source.file.read_exact_at(&mut file_header_bytes.0, 0)?;
-            let file_header: &FileHeader = bytemuck::from_bytes(&file_header_bytes.0);
+            let mut file_header_bytes = AlignedBuffer::<FILE_HEADER_SIZE>::default();
+            source.file.read_exact_at(&mut *file_header_bytes, 0)?;
+            let file_header: &FileHeader = bytemuck::from_bytes(&*file_header_bytes);
             file_header.validate(source.id)?;
 
             for entry in source.entries() {
@@ -76,7 +76,7 @@ impl<S: ImmutableBlob> BlobCompactable for Vec<Blob<S>> {
                 let data_len = header.data_len() as usize;
                 io_buf.resize(data_len, 0);
 
-                let data_offset = offset + OBJECT_HEADER_SIZE;
+                let data_offset = offset + OBJECT_HEADER_SIZE as u64;
                 source.file.read_exact_at(&mut io_buf, data_offset)?;
 
                 // TODO: Performance - Checksum Offloading.

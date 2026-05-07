@@ -108,7 +108,10 @@ impl BlobStorage {
 
 impl BlobStorage {
     pub fn put(&mut self, object_id: u64, data: &[u8]) -> io::Result<ObjectOffset> {
-        let total_needed = align_to_page(OBJECT_HEADER_SIZE + data.len() as u64, self.page_size);
+        let total_needed = align_to_page(
+            OBJECT_HEADER_SIZE as u64 + data.len() as u64,
+            self.page_size,
+        );
         if total_needed > self.threshold {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

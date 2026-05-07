@@ -4,9 +4,10 @@ use bytemuck::{Pod, Zeroable};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-pub const BLOB_MAGIC: u32 = 0x56424c42; // "VBLB"
+pub const FILE_MAGIC: u32 = 0x56424c42; // "VBLB"
+pub const FILE_HEADER_SIZE: usize = size_of::<FileHeader>();
 pub const OBJECT_MAGIC: u32 = 0x564F424A; // "VOBJ"
-pub const OBJECT_HEADER_SIZE: u64 = size_of::<ObjectHeader>() as u64;
+pub const OBJECT_HEADER_SIZE: usize = size_of::<ObjectHeader>();
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
@@ -24,7 +25,7 @@ pub struct FileHeader {
 impl FileHeader {
     pub fn new(id: Uuid, count: u32, capacity: u64, created_at: DateTime<Utc>) -> Self {
         Self {
-            magic: BLOB_MAGIC.to_le(),
+            magic: FILE_MAGIC.to_le(),
             version: 1u32.to_le(),
             capacity: capacity.to_le(),
             created_at: created_at.timestamp().to_le(),
@@ -62,7 +63,7 @@ impl FileHeader {
     }
 
     pub fn validate(&self, id: Uuid) -> io::Result<()> {
-        if self.magic() != BLOB_MAGIC {
+        if self.magic() != FILE_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid file header magic number",
@@ -135,6 +136,6 @@ impl ObjectHeader {
     }
 
     pub fn object_size(&self) -> u64 {
-        OBJECT_HEADER_SIZE + self.data_len() as u64
+        OBJECT_HEADER_SIZE as u64 + self.data_len() as u64
     }
 }
