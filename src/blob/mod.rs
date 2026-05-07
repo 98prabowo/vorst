@@ -1,14 +1,10 @@
+mod compaction;
+mod file;
 mod format;
 mod state;
+mod types;
 
-pub mod compaction;
-pub mod core;
-pub mod types;
-
-pub use compaction::BlobCompactable;
-pub use core::Blob;
-pub use state::*;
-pub use types::*;
+pub use types::{CompactedBlob, CompactionMap, ObjectOffset};
 
 use std::{
     collections::HashMap,
@@ -19,9 +15,11 @@ use std::{
 use uuid::Uuid;
 
 use crate::blob::{
-    compaction::{CompactionPlan, CompactionPolicy},
-    core::{FLAG_NONE, FLAG_TOMBSTONE, align_to_page},
+    compaction::BlobCompactable,
+    file::{Blob, FLAG_NONE, FLAG_TOMBSTONE, align_to_page},
     format::{OBJECT_HEADER_SIZE, ObjectHeader},
+    state::{Active, Compacted, Sealed},
+    types::{CompactionPlan, CompactionPolicy},
 };
 
 const ACTIVE_DIR: &str = "ingestion";

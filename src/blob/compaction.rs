@@ -1,37 +1,15 @@
 use std::{io, os::unix::fs::FileExt, path::Path};
 
-use chrono::Duration;
 use uuid::Uuid;
 
 use crate::blob::{
-    Active, Blob, Compacted, CompactedBlob, CompactionMap, ImmutableBlob,
-    core::{AlignedBuffer, FLAG_TOMBSTONE, Hasher},
+    file::{AlignedBuffer, Blob, FLAG_TOMBSTONE, Hasher},
     format::{FileHeader, OBJECT_HEADER_SIZE},
+    state::{Active, Compacted, ImmutableBlob},
+    types::{CompactedBlob, CompactionMap},
 };
 
 const INITIAL_IO_BUFFER_SIZE: usize = 1024 * 1024;
-
-pub struct CompactionPlan {
-    pub candidates: Vec<Uuid>,
-}
-
-pub struct CompactionPolicy {
-    pub max_sealed_files: usize,
-    pub max_sealed_bytes: u64,
-    pub tombstone_threshold: f32,
-    pub min_interval: Duration,
-}
-
-impl Default for CompactionPolicy {
-    fn default() -> Self {
-        Self {
-            max_sealed_files: 10,
-            max_sealed_bytes: 20 * 1024 * 1024 * 1024,
-            tombstone_threshold: 0.3,
-            min_interval: Duration::seconds(3600),
-        }
-    }
-}
 
 // TODO: Implement "Leveled Compaction." Currently, we are compacting a
 // `Vec<Blob>`. We should implement a strategy (like RocksDB) where smaller

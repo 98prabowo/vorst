@@ -11,8 +11,9 @@ use uuid::Uuid;
 
 use crate::{
     blob::{
-        Active, BlobState, ImmutableBlob, ObjectOffset, Sealed,
         format::{FileHeader, OBJECT_HEADER_SIZE, OBJECT_MAGIC, ObjectHeader},
+        state::{Active, BlobState, ImmutableBlob, Sealed},
+        types::ObjectOffset,
     },
     sys::preallocate,
 };
