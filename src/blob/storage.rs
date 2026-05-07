@@ -246,7 +246,7 @@ impl Blob<Active> {
         })
     }
 
-    pub fn open<P>(path: P, threshold: u64, page_size: u64) -> io::Result<Self>
+    pub fn open<P>(path: P, page_size: u64) -> io::Result<Self>
     where
         P: AsRef<Path>,
     {
@@ -274,12 +274,15 @@ impl Blob<Active> {
         let file_header: &FileHeader = bytemuck::from_bytes(&file_header_bytes.0);
         file_header.validate(id)?;
 
+        let threshold = file.metadata()?.len();
+        let created_at = file_header.created_at()?;
+
         let mut blob = Self {
             id,
             path: path_buf,
             file,
             page_size,
-            created_at: file_header.created_at()?,
+            created_at,
             state: Active {
                 threshold,
                 entries_count: 0,
