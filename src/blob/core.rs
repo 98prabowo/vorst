@@ -19,8 +19,8 @@ use crate::{
 
 // MARK: - Constants
 
-pub const BLOB_PREFIX: &str = "vb-";
-pub const BLOB_EXTENSION: &str = ".blob";
+const BLOB_PREFIX: &str = "vb-";
+const BLOB_EXTENSION: &str = ".blob";
 
 pub const FLAG_NONE: u16 = 0x0000;
 pub const FLAG_TOMBSTONE: u16 = 0x0001;
@@ -59,7 +59,7 @@ impl<S: BlobState> Blob<S> {
         format!("{}{}{}", BLOB_PREFIX, uuid, BLOB_EXTENSION)
     }
 
-    pub fn read_entry(&mut self, offset: u64) -> io::Result<(ObjectHeader, Vec<u8>)> {
+    pub fn read_entry(&self, offset: u64) -> io::Result<(ObjectHeader, Vec<u8>)> {
         // TODO: Add a "scrubber" utility. Over time, bit rot can occur on disk. We need a
         // background process that iterates through sealed blobs and verifies checksums.
 
@@ -110,7 +110,7 @@ impl<S: BlobState> Blob<S> {
         Ok((object_header, data))
     }
 
-    pub fn scan_offsets(&mut self) -> io::Result<Vec<ObjectOffset>> {
+    pub fn scan_offsets(&self) -> io::Result<Vec<ObjectOffset>> {
         // TODO: Sidecar Index Files. Reading the entire blob to reconstruct the index on
         // startup is too slow for large files. We should write a `.index` file (containing
         // `object_id -> offset`) alongside the `.blob` during the seal process.
@@ -503,7 +503,7 @@ impl Hasher {
 pub struct AlignedBuffer<const N: usize>(pub [u8; N]);
 
 #[inline(always)]
-const fn align_to_page(size: u64, page_size: u64) -> u64 {
+pub const fn align_to_page(size: u64, page_size: u64) -> u64 {
     // NOTE: Current page alignment is hardcoded to the provided `page_size`. In
     // production, we should query `libc::sysconf(_SC_PAGESIZE)` or use `O_DIRECT`
     // requirements (usually 512 or 4096 bytes) to ensure we are actually hitting

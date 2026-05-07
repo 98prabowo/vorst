@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use uuid::Uuid;
 
-use crate::blob::{Compacted, storage::Blob};
+use crate::blob::{Blob, Compacted};
 
 pub struct ObjectOffset {
     pub object_id: u64,
