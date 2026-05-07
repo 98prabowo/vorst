@@ -27,6 +27,10 @@ pub const FLAG_CORRUPTED: u16 = 0x0002;
 
 // MARK: - Storage Implementation
 
+// TODO: Implement `io_uring` support for Linux. While this is a file storage layer, the
+// ability to perform high-depth asynchronous reads will be critical when the application
+// needs to fetch hundreds of raw files simultaneously (e.g., during a batch export or secondary processing
+
 pub struct Blob<S: BlobState> {
     pub id: Uuid,
     pub path: PathBuf,
@@ -55,6 +59,9 @@ impl<S: BlobState> Blob<S> {
     }
 
     pub fn read_entry(&mut self, offset: u64) -> io::Result<(ObjectHeader, Vec<u8>)> {
+        // TODO: Add a "scrubber" utility. Over time, bit rot can occur on disk. We need a
+        // background process that iterates through sealed blobs and verifies checksums.
+
         let file_len = self.file.metadata()?.len();
 
         if offset + OBJECT_HEADER_SIZE > file_len {
@@ -95,10 +102,18 @@ impl<S: BlobState> Blob<S> {
             ));
         }
 
+        // TODO: Performance Optimization - `sendfile(2)` or `mmap`. If this blob storage is
+        // serving files over a network later, look into using `sendfile` to bypass user-space
+        // copying entirely, or `mmap` for frequently accessed "hot" files.
+
         Ok((object_header, data))
     }
 
     pub fn scan_offsets(&mut self) -> io::Result<Vec<ObjectOffset>> {
+        // TODO: Sidecar Index Files. Reading the entire blob to reconstruct the index on
+        // startup is too slow for large files. We should write a `.index` file (containing
+        // `object_id -> offset`) alongside the `.blob` during the seal process.
+
         let mut index = Vec::new();
         let file_len = self.file.metadata()?.len();
         let mut cursor = self.page_size;
@@ -304,6 +319,10 @@ impl Blob<Active> {
     }
 
     fn ingest_with_flags(&mut self, id: u64, data: &[u8], flags: u16) -> io::Result<u64> {
+        // FIXME: Implement a write-ahead log (WAL) or a "commit" bit for individual
+        // objects. Currently, if the process crashes mid-write, a partial object might exist
+        // that passes the magic number check but contains garbage data.
+
         let offset = self.state.write_cursor;
 
         let total_len = OBJECT_HEADER_SIZE + data.len() as u64;
@@ -323,6 +342,11 @@ impl Blob<Active> {
         let checksum = Hasher::hash(data);
         let object_header = ObjectHeader::new(id, data_len, flags, checksum);
 
+        // FIXME: Use `pwritev` (Vectored I/O). Instead of creating a temporary `Vec`
+        // and padding it with zeros, use `io::IoSlice` to write the header, data, and
+        // padding in a single atomic syscall. This avoids zero-filling memory and
+        // extra copies.
+
         let mut entry = Vec::with_capacity(padded_len);
         entry.extend_from_slice(bytemuck::bytes_of(&object_header));
         entry.extend_from_slice(data);
@@ -339,6 +363,11 @@ impl Blob<Active> {
     where
         P: AsRef<Path>,
     {
+        // TODO: Implement a "Manifest" or "Control File." Currently, the existence of a
+        // `.blob` file is the only record of its validity. A manifest would track all active,
+        // sealed, and compacted blobs atomically, preventing orphan files after a crash
+        // during compaction.
+
         FileHeader::write_sealed_at(&self.file, Utc::now())?;
         FileHeader::write_entries_count(&self.file, self.state.entries_count)?;
 
@@ -445,6 +474,11 @@ pub struct AlignedBuffer<const N: usize>(pub [u8; N]);
 
 #[inline(always)]
 const fn align_to_page(size: u64, page_size: u64) -> u64 {
+    // NOTE: Current page alignment is hardcoded to the provided `page_size`. In
+    // production, we should query `libc::sysconf(_SC_PAGESIZE)` or use `O_DIRECT`
+    // requirements (usually 512 or 4096 bytes) to ensure we are actually hitting
+    // the disk's physical sector boundaries for maximum throughput.
+
     debug_assert!(page_size.is_power_of_two());
     let page_mask = page_size - 1;
     (size + page_mask) & !page_mask

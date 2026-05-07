@@ -10,6 +10,11 @@ use crate::blob::{
 
 const INITIAL_IO_BUFFER_SIZE: usize = 1024 * 1024;
 
+// TODO: Implement "Leveled Compaction." Currently, we are compacting a
+// `Vec<Blob>`. We should implement a strategy (like RocksDB) where smaller
+// blobs are merged into larger ones over time to keep the number of open file
+// descriptors manageable.
+
 pub trait BlobCompactable {
     fn compact<P, F>(
         self,
@@ -41,6 +46,10 @@ impl<S: ImmutableBlob> BlobCompactable for Vec<Blob<S>> {
         let mut removed_paths = Vec::new();
         let mut io_buf = Vec::with_capacity(INITIAL_IO_BUFFER_SIZE);
 
+        // TODO: Parallelize Compaction. Since blobs are immutable once sealed, we can
+        // use `rayon` to process multiple source blobs in parallel and then merge them
+        // into the new blob using an ordered writer.
+
         for source in self {
             let mut file_header_bytes = AlignedBuffer([0u8; size_of::<FileHeader>()]);
             source.file.read_exact_at(&mut file_header_bytes.0, 0)?;
@@ -69,6 +78,10 @@ impl<S: ImmutableBlob> BlobCompactable for Vec<Blob<S>> {
                 let data_offset = offset + OBJECT_HEADER_SIZE;
                 source.file.read_exact_at(&mut io_buf, data_offset)?;
 
+                // TODO: Performance - Checksum Offloading.
+                // We are currently "scrubbing" (re-verifying) every object during compaction.
+                // While safe, this is CPU-intensive. Consider using hardware-accelerated CRC32
+                // or providing a "fast-path" copy for trusted media.
                 let new_offset = if header.checksum() == Hasher::hash(&io_buf) {
                     new_blob.ingest(header.object_id(), &io_buf)?
                 } else {
@@ -86,6 +99,11 @@ impl<S: ImmutableBlob> BlobCompactable for Vec<Blob<S>> {
             removed_ids.push(source.id);
             removed_paths.push(source.path);
         }
+
+        // FIXME: Atomic Metadata Handoff. After the new blob is sealed, the "Source of Truth"
+        // (Sled) must be updated to map File IDs to the new `BlobID` and `Offset` before the
+        // old files are unlinked. We need a two-phase commit or a "tombstone" record in the
+        // metadata to ensure we don't lose file access if we crash mid-cleanup.
 
         let sealed_blob = new_blob.seal(&base_dir)?;
 
