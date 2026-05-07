@@ -5,7 +5,7 @@ pub trait ImmutableBlob: BlobState {}
 
 #[derive(Default)]
 pub struct Active {
-    pub threshold: u64,
+    pub capacity: u64,
     pub entries_count: u32,
     pub write_cursor: u64,
 }

@@ -19,7 +19,7 @@ pub trait BlobCompactable {
     fn compact<P, F>(
         self,
         base_dir: P,
-        threshold: u64,
+        capacity: u64,
         page_size: u64,
         is_latest: F,
     ) -> io::Result<CompactedBlob>
@@ -32,7 +32,7 @@ impl<S: ImmutableBlob> BlobCompactable for Vec<Blob<S>> {
     fn compact<P, F>(
         self,
         base_dir: P,
-        threshold: u64,
+        capacity: u64,
         page_size: u64,
         is_latest: F,
     ) -> io::Result<CompactedBlob>
@@ -40,7 +40,7 @@ impl<S: ImmutableBlob> BlobCompactable for Vec<Blob<S>> {
         P: AsRef<Path>,
         F: Fn(u64, Uuid, u64) -> bool,
     {
-        let mut new_blob = Blob::<Active>::new(&base_dir, threshold, page_size)?;
+        let mut new_blob = Blob::<Active>::new(&base_dir, capacity, page_size)?;
         let mut mappings = Vec::new();
         let mut removed_ids = Vec::new();
         let mut removed_paths = Vec::new();

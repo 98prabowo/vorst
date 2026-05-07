@@ -13,7 +13,7 @@ pub const OBJECT_HEADER_SIZE: u64 = size_of::<ObjectHeader>() as u64;
 pub struct FileHeader {
     magic: u32,
     version: u32,
-    threshold: u64,
+    capacity: u64,
     created_at: i64,
     sealed_at: i64,
     entries_count: u32,
@@ -22,11 +22,11 @@ pub struct FileHeader {
 }
 
 impl FileHeader {
-    pub fn new(id: Uuid, count: u32, threshold: u64, created_at: DateTime<Utc>) -> Self {
+    pub fn new(id: Uuid, count: u32, capacity: u64, created_at: DateTime<Utc>) -> Self {
         Self {
             magic: BLOB_MAGIC.to_le(),
             version: 1u32.to_le(),
-            threshold: threshold.to_le(),
+            capacity: capacity.to_le(),
             created_at: created_at.timestamp().to_le(),
             sealed_at: 0,
             entries_count: count.to_le(),
@@ -39,8 +39,8 @@ impl FileHeader {
         u32::from_le(self.magic)
     }
 
-    pub fn threshold(&self) -> u64 {
-        u64::from_le(self.threshold)
+    pub fn capacity(&self) -> u64 {
+        u64::from_le(self.capacity)
     }
 
     pub fn created_at(&self) -> io::Result<DateTime<Utc>> {

@@ -217,7 +217,7 @@ impl Blob<Active> {
     where
         P: AsRef<Path>,
     {
-        let threshold = page_size + data_capacity;
+        let capacity = page_size + data_capacity;
         let now = Utc::now();
 
         let id = Uuid::now_v7();
@@ -241,10 +241,10 @@ impl Blob<Active> {
             )
         })?;
 
-        let header = FileHeader::new(id, 0, threshold, now);
+        let header = FileHeader::new(id, 0, capacity, now);
         file.write_all_at(bytemuck::bytes_of(&header), 0)?;
 
-        preallocate(&file, threshold)?;
+        preallocate(&file, capacity)?;
         file.sync_all()?;
 
         if let Some(parent) = path.parent() {
@@ -259,7 +259,7 @@ impl Blob<Active> {
             page_size,
             created_at: now,
             state: Active {
-                threshold,
+                capacity,
                 entries_count: 0,
                 write_cursor: page_size,
             },
@@ -301,7 +301,7 @@ impl Blob<Active> {
         let file_header: &FileHeader = bytemuck::from_bytes(&file_header_bytes.0);
         file_header.validate(id)?;
 
-        let threshold = file_header.threshold();
+        let capacity = file_header.capacity();
         let created_at = file_header.created_at()?;
 
         let mut blob = Self {
@@ -311,7 +311,7 @@ impl Blob<Active> {
             page_size,
             created_at,
             state: Active {
-                threshold,
+                capacity,
                 entries_count: 0,
                 write_cursor: page_size,
             },
@@ -358,12 +358,12 @@ impl Blob<Active> {
         let total_len = OBJECT_HEADER_SIZE + data.len() as u64;
         let padded_len = align_to_page(total_len, self.page_size) as usize;
 
-        if offset + padded_len as u64 > self.state.threshold {
+        if offset + padded_len as u64 > self.state.capacity {
             return Err(io::Error::new(
                 io::ErrorKind::StorageFull,
                 format!(
-                    "blob capacity reached. offset {} + needed {} > threshold {}",
-                    offset, padded_len, self.state.threshold
+                    "blob capacity reached. offset {} + needed {} > capacity {}",
+                    offset, padded_len, self.state.capacity
                 ),
             ));
         }
