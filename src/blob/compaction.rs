@@ -3,8 +3,8 @@ use std::{io, os::unix::fs::FileExt, path::Path};
 use uuid::Uuid;
 
 use crate::blob::{
-    file::{AlignedBuffer, Blob, FLAG_TOMBSTONE, Hasher},
     format::{FILE_HEADER_SIZE, FileHeader, OBJECT_HEADER_SIZE},
+    segment::{AlignedBuffer, FLAG_TOMBSTONE, Hasher, Segment},
     state::{Active, Compacted, ImmutableBlob},
     types::{CompactedBlob, CompactionMap},
 };
@@ -29,7 +29,7 @@ pub trait BlobCompactable {
         F: Fn(u64, Uuid, u64) -> bool;
 }
 
-impl<S: ImmutableBlob> BlobCompactable for Vec<Blob<S>> {
+impl<S: ImmutableBlob> BlobCompactable for Vec<Segment<S>> {
     fn compact<P, F>(
         self,
         base_dir: P,
@@ -41,7 +41,7 @@ impl<S: ImmutableBlob> BlobCompactable for Vec<Blob<S>> {
         P: AsRef<Path>,
         F: Fn(u64, Uuid, u64) -> bool,
     {
-        let mut new_blob = Blob::<Active>::new(&base_dir, capacity, page_size)?;
+        let mut new_blob = Segment::<Active>::new(&base_dir, capacity, page_size)?;
         let mut mappings = Vec::new();
         let mut removed_ids = Vec::new();
         let mut removed_paths = Vec::new();
@@ -109,7 +109,7 @@ impl<S: ImmutableBlob> BlobCompactable for Vec<Blob<S>> {
         let sealed_blob = new_blob.seal(&base_dir)?;
 
         Ok(CompactedBlob {
-            new_blob: Blob {
+            new_blob: Segment {
                 id: sealed_blob.id,
                 path: sealed_blob.path,
                 file: sealed_blob.file,

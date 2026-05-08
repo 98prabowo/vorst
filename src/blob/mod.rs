@@ -1,6 +1,6 @@
 mod compaction;
-mod file;
 mod format;
+mod segment;
 mod state;
 mod types;
 
@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use crate::blob::{
     compaction::BlobCompactable,
-    file::{Blob, FLAG_NONE, FLAG_TOMBSTONE, align_to_page},
     format::{OBJECT_HEADER_SIZE, ObjectHeader},
+    segment::{FLAG_NONE, FLAG_TOMBSTONE, Segment, align_to_page},
     state::{Active, Compacted, Sealed},
     types::{CompactionPlan, CompactionPolicy},
 };
@@ -28,9 +28,9 @@ const COMPACTED_DIR: &str = "compacted";
 
 pub struct BlobStorage {
     base_dir: PathBuf,
-    active: Option<Blob<Active>>,
-    sealed: HashMap<Uuid, Blob<Sealed>>,
-    compacted: HashMap<Uuid, Blob<Compacted>>,
+    active: Option<Segment<Active>>,
+    sealed: HashMap<Uuid, Segment<Sealed>>,
+    compacted: HashMap<Uuid, Segment<Compacted>>,
     threshold: u64,
     page_size: u64,
     compaction_policy: CompactionPolicy,
@@ -58,14 +58,14 @@ impl BlobStorage {
             .filter_map(|e| e.ok())
             .map(|e| e.path())
             .find(|p| p.extension().is_some_and(|ext| ext == "tmp"))
-            .map(|path| Blob::<Active>::open(path, page_size))
+            .map(|path| Segment::<Active>::open(path, page_size))
             .transpose()?;
 
         let sealed_root = root.join(SEALED_DIR);
         let sealed_paths = Self::discover_sharded_blob_paths(sealed_root, "blob")?;
         let mut sealed = HashMap::with_capacity(sealed_paths.len());
         for path in sealed_paths {
-            let blob = Blob::<Sealed>::open_readonly(path, page_size)?;
+            let blob = Segment::<Sealed>::open_readonly(path, page_size)?;
             sealed.insert(blob.id(), blob);
         }
 
@@ -73,7 +73,7 @@ impl BlobStorage {
         let compacted_paths = Self::discover_sharded_blob_paths(compacted_root, "blob")?;
         let mut compacted = HashMap::with_capacity(compacted_paths.len());
         for path in compacted_paths {
-            let blob = Blob::<Compacted>::open_readonly(path, page_size)?;
+            let blob = Segment::<Compacted>::open_readonly(path, page_size)?;
             compacted.insert(blob.id(), blob);
         }
 
@@ -120,7 +120,7 @@ impl BlobStorage {
         }
 
         if self.active.is_none() {
-            self.active = Some(Blob::<Active>::new(
+            self.active = Some(Segment::<Active>::new(
                 self.base_dir.join(ACTIVE_DIR),
                 self.threshold,
                 self.page_size,
@@ -162,7 +162,7 @@ impl BlobStorage {
         let sealed = old_active.seal(sealed_dir)?;
         self.sealed.insert(sealed.id(), sealed);
 
-        let mut next_active = Blob::<Active>::new(
+        let mut next_active = Segment::<Active>::new(
             self.base_dir.join(ACTIVE_DIR),
             self.threshold,
             self.page_size,
@@ -219,7 +219,7 @@ impl BlobStorage {
 impl BlobStorage {
     pub fn delete(&mut self, object_id: u64) -> io::Result<ObjectOffset> {
         if self.active.is_none() {
-            self.active = Some(Blob::<Active>::new(
+            self.active = Some(Segment::<Active>::new(
                 self.base_dir.join(ACTIVE_DIR),
                 self.threshold,
                 self.page_size,
@@ -277,7 +277,7 @@ impl BlobStorage {
             None => return Ok(None),
         };
 
-        let sources: Vec<Blob<Sealed>> = plan
+        let sources: Vec<Segment<Sealed>> = plan
             .candidates
             .iter()
             .filter_map(|id| self.sealed.remove(id))

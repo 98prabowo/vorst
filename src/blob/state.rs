@@ -1,4 +1,4 @@
-use crate::blob::CompactionMap;
+use crate::blob::types::CompactionMap;
 
 pub trait BlobState: Default {}
 pub trait ImmutableBlob: BlobState {}

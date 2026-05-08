@@ -34,7 +34,7 @@ pub const FLAG_CORRUPTED: u16 = 0x0002;
 // ability to perform high-depth asynchronous reads will be critical when the application
 // needs to fetch hundreds of raw files simultaneously (e.g., during a batch export or secondary processing
 
-pub struct Blob<S: BlobState> {
+pub struct Segment<S: BlobState> {
     pub id: Uuid,
     pub path: PathBuf,
     pub file: File,
@@ -43,7 +43,7 @@ pub struct Blob<S: BlobState> {
     pub state: S,
 }
 
-impl<S: BlobState> Blob<S> {
+impl<S: BlobState> Segment<S> {
     pub fn id(&self) -> Uuid {
         self.id
     }
@@ -163,7 +163,7 @@ impl<S: BlobState> Blob<S> {
     }
 }
 
-impl<S: ImmutableBlob> Blob<S> {
+impl<S: ImmutableBlob> Segment<S> {
     pub fn open_readonly<P>(path: P, page_size: u64) -> io::Result<Self>
     where
         P: AsRef<Path>,
@@ -213,7 +213,7 @@ impl<S: ImmutableBlob> Blob<S> {
     }
 }
 
-impl Blob<Active> {
+impl Segment<Active> {
     pub fn new<P>(base_dir: P, data_capacity: u64, page_size: u64) -> io::Result<Self>
     where
         P: AsRef<Path>,
@@ -390,7 +390,7 @@ impl Blob<Active> {
         Ok(offset)
     }
 
-    pub fn seal<P>(self, base_dir: P) -> io::Result<Blob<Sealed>>
+    pub fn seal<P>(self, base_dir: P) -> io::Result<Segment<Sealed>>
     where
         P: AsRef<Path>,
     {
@@ -421,7 +421,7 @@ impl Blob<Active> {
             eprintln!("Lock downgrade for blob {} returned: {}.", self.id, e);
         }
 
-        Ok(Blob {
+        Ok(Segment {
             id: self.id,
             path: sealed_path,
             file: self.file,
@@ -433,12 +433,12 @@ impl Blob<Active> {
 }
 
 pub struct ObjectIterator<'a, S: ImmutableBlob> {
-    blob: &'a Blob<S>,
+    blob: &'a Segment<S>,
     cursor: u64,
     file_len: u64,
 }
 
-impl<S: ImmutableBlob> Blob<S> {
+impl<S: ImmutableBlob> Segment<S> {
     pub fn entries(&self) -> ObjectIterator<'_, S> {
         ObjectIterator {
             blob: self,

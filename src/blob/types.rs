@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use chrono::Duration;
 use uuid::Uuid;
 
-use crate::blob::{file::Blob, state::Compacted};
+use crate::blob::{segment::Segment, state::Compacted};
 
 pub struct ObjectOffset {
     pub object_id: u64,
@@ -19,7 +19,7 @@ pub struct CompactionMap {
 }
 
 pub struct CompactedBlob {
-    pub new_blob: Blob<Compacted>,
+    pub new_blob: Segment<Compacted>,
     pub removed_blob_ids: Vec<Uuid>,
     pub removed_paths: Vec<PathBuf>,
 }
