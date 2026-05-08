@@ -18,6 +18,46 @@ const ACTIVE_DIR: &str = "ingestion";
 const SEALED_DIR: &str = "sealed";
 const COMPACTED_DIR: &str = "compacted";
 
+const SEGMENT_PREFIX: &str = "vb-";
+const SEGMENT_EXTENSION: &str = ".blob";
+
+pub struct StorageLayout {
+    base_dir: PathBuf,
+}
+
+impl StorageLayout {
+    pub fn new<P>(base_dir: P) -> Self
+    where
+        P: AsRef<Path>,
+    {
+        Self {
+            base_dir: base_dir.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn segment_file_name(&self, id: &Uuid) -> String {
+        format!("{}{}{}", SEGMENT_PREFIX, id, SEGMENT_EXTENSION)
+    }
+
+    pub fn temp_file_name(&self, id: &Uuid) -> String {
+        format!("{}.tmp", self.segment_file_name(id))
+    }
+
+    pub fn shard_path(&self, id: &Uuid) -> PathBuf {
+        let uuid_str = id.to_string();
+        let shard = &uuid_str[uuid_str.len() - 2..];
+        self.base_dir.join(shard)
+    }
+
+    pub fn active_segment_path(&self, id: &Uuid) -> PathBuf {
+        self.shard_path(id).join(self.temp_file_name(id))
+    }
+
+    pub fn sealed_segment_path(&self, id: &Uuid) -> PathBuf {
+        self.shard_path(id).join(self.segment_file_name(id))
+    }
+}
+
 pub struct BlobStorage {
     base_dir: PathBuf,
     active: Option<Segment<Active>>,

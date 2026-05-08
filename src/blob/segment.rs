@@ -1,9 +1,9 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{File, OpenOptions},
     io,
     ops::{Deref, DerefMut},
     os::unix::fs::FileExt,
-    path::{Path, PathBuf},
+    path::PathBuf,
 };
 
 use chrono::{DateTime, Utc};
@@ -23,9 +23,6 @@ use crate::{
 };
 
 // MARK: - Constants
-
-const BLOB_PREFIX: &str = "vb-";
-const BLOB_EXTENSION: &str = ".blob";
 
 pub const FLAG_NONE: u16 = 0x0000;
 pub const FLAG_TOMBSTONE: u16 = 0x0001;
@@ -49,19 +46,6 @@ pub struct Segment<S: BlobState> {
 impl<S: BlobState> Segment<S> {
     pub fn id(&self) -> Uuid {
         self.id
-    }
-
-    fn compute_shard_path<P>(base_dir: P, id: Uuid) -> PathBuf
-    where
-        P: AsRef<Path>,
-    {
-        let uuid_str = id.to_string();
-        let shard = &uuid_str[uuid_str.len() - 2..];
-        base_dir.as_ref().join(shard)
-    }
-
-    fn generate_filename(uuid: &Uuid) -> String {
-        format!("{}{}{}", BLOB_PREFIX, uuid, BLOB_EXTENSION)
     }
 
     pub fn read_entry(&self, offset: u64) -> io::Result<(ObjectHeader, Vec<u8>)> {
@@ -167,33 +151,13 @@ impl<S: BlobState> Segment<S> {
 }
 
 impl<S: ImmutableBlob> Segment<S> {
-    pub fn open_readonly<P>(path: P, page_size: u64) -> io::Result<Self>
-    where
-        P: AsRef<Path>,
-    {
-        let path_buf = path.as_ref().to_path_buf();
-
-        let filename = path_buf
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
-
-        let id_str = filename
-            .strip_prefix(BLOB_PREFIX)
-            .and_then(|s| s.split(".").next())
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "filename format mismatch")
-            })?;
-
-        let id = Uuid::parse_str(id_str)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UUID"))?;
-
-        let file = File::open(&path_buf)?;
+    pub fn open_readonly(id: Uuid, path: PathBuf, page_size: u64) -> io::Result<Self> {
+        let file = File::open(&path)?;
 
         file.try_lock_shared().map_err(|_| {
             io::Error::other(format!(
-                "Could not acquire shared lock on blob: {:?}",
-                path_buf
+                "Could not acquire shared lock on segment: {:?}",
+                path
             ))
         })?;
 
@@ -207,7 +171,7 @@ impl<S: ImmutableBlob> Segment<S> {
 
         Ok(Self {
             id,
-            path: path_buf,
+            path,
             file,
             page_size,
             created_at,
@@ -217,19 +181,9 @@ impl<S: ImmutableBlob> Segment<S> {
 }
 
 impl Segment<Active> {
-    pub fn new<P>(base_dir: P, data_capacity: u64, page_size: u64) -> io::Result<Self>
-    where
-        P: AsRef<Path>,
-    {
+    pub fn new(id: Uuid, path: PathBuf, data_capacity: u64, page_size: u64) -> io::Result<Self> {
         let capacity = page_size + data_capacity;
         let now = Utc::now();
-
-        let id = Uuid::now_v7();
-        let active_dir = Self::compute_shard_path(base_dir, id);
-        fs::create_dir_all(&active_dir)?;
-
-        let filename = Self::generate_filename(&id);
-        let path = active_dir.join(format!("{filename}.tmp"));
 
         let file = OpenOptions::new()
             .read(true)
@@ -270,33 +224,13 @@ impl Segment<Active> {
         })
     }
 
-    pub fn open<P>(path: P, page_size: u64) -> io::Result<Self>
-    where
-        P: AsRef<Path>,
-    {
-        let path_buf = path.as_ref().to_path_buf();
-
-        let filename = path_buf
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid path"))?;
-
-        let id_str = filename
-            .strip_prefix(BLOB_PREFIX)
-            .and_then(|s| s.strip_suffix(".blob.tmp"))
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "filename format mismatch")
-            })?;
-
-        let id = Uuid::parse_str(id_str)
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid UUID in filename"))?;
-
-        let file = OpenOptions::new().read(true).write(true).open(&path_buf)?;
+    pub fn open<P>(id: Uuid, path: PathBuf, page_size: u64) -> io::Result<Self> {
+        let file = OpenOptions::new().read(true).write(true).open(&path)?;
 
         file.try_lock_exclusive().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::AddrInUse,
-                format!("Blob is already locked by another process: {:?}", path_buf),
+                format!("Blob is already locked by another process: {:?}", path),
             )
         })?;
 
@@ -310,7 +244,7 @@ impl Segment<Active> {
 
         let mut blob = Self {
             id,
-            path: path_buf,
+            path,
             file,
             page_size,
             created_at,
@@ -393,10 +327,7 @@ impl Segment<Active> {
         Ok(offset)
     }
 
-    pub fn seal<P>(self, base_dir: P) -> io::Result<Segment<Sealed>>
-    where
-        P: AsRef<Path>,
-    {
+    pub fn seal(self) -> io::Result<Segment<Sealed>> {
         // TODO: Implement a "Manifest" or "Control File." Currently, the existence of a
         // `.blob` file is the only record of its validity. A manifest would track all active,
         // sealed, and compacted blobs atomically, preventing orphan files after a crash
@@ -409,24 +340,13 @@ impl Segment<Active> {
         self.file.set_len(final_size)?; // Trim preallocation
         self.file.sync_all()?;
 
-        let sealed_dir = Self::compute_shard_path(base_dir, self.id);
-        fs::create_dir_all(&sealed_dir)?;
-
-        let file_name = Self::generate_filename(&self.id);
-        let sealed_path = sealed_dir.join(file_name);
-
-        fs::rename(&self.path, &sealed_path)?;
-
-        let dir = File::open(&sealed_dir)?;
-        dir.sync_all()?;
-
         if let Err(e) = self.file.lock_shared() {
             eprintln!("Lock downgrade for blob {} returned: {}.", self.id, e);
         }
 
         Ok(Segment {
             id: self.id,
-            path: sealed_path,
+            path: self.path,
             file: self.file,
             page_size: self.page_size,
             created_at: self.created_at,
