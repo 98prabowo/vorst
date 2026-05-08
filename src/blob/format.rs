@@ -4,9 +4,13 @@ use bytemuck::{Pod, Zeroable};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-pub const FILE_MAGIC: u32 = 0x56424c42; // "VBLB"
-pub const FILE_HEADER_SIZE: usize = size_of::<FileHeader>();
-pub const OBJECT_MAGIC: u32 = 0x564F424A; // "VOBJ"
+// "VBSF" (Vorst Blob Segment File)
+pub const SEGMENT_MAGIC: u32 = 0x56425346;
+
+// "VBSO" (Vorst Blob Segment Object)
+pub const OBJECT_MAGIC: u32 = 0x5642534F;
+
+pub const SEGMENT_HEADER_SIZE: usize = size_of::<SegmentHeader>();
 pub const OBJECT_HEADER_SIZE: usize = size_of::<ObjectHeader>();
 
 pub const FLAG_NONE: u16 = 0x0000;
@@ -15,27 +19,27 @@ pub const FLAG_CORRUPTED: u16 = 0x0002;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
-pub struct FileHeader {
+pub struct SegmentHeader {
     magic: u32,
     version: u32,
     capacity: u64,
     created_at: i64,
     sealed_at: i64,
     entries_count: u32,
-    blob_id: [u8; 16],
+    segment_id: [u8; 16],
     _padding: [u8; 4],
 }
 
-impl FileHeader {
+impl SegmentHeader {
     pub fn new(id: Uuid, count: u32, capacity: u64, created_at: DateTime<Utc>) -> Self {
         Self {
-            magic: FILE_MAGIC.to_le(),
+            magic: SEGMENT_MAGIC.to_le(),
             version: 1u32.to_le(),
             capacity: capacity.to_le(),
             created_at: created_at.timestamp().to_le(),
             sealed_at: 0,
             entries_count: count.to_le(),
-            blob_id: id.into_bytes(),
+            segment_id: id.into_bytes(),
             _padding: [0u8; 4],
         }
     }
@@ -50,8 +54,9 @@ impl FileHeader {
 
     pub fn created_at(&self) -> io::Result<DateTime<Utc>> {
         let ts = i64::from_le(self.created_at);
-        DateTime::from_timestamp_secs(ts)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid blob file header"))
+        DateTime::from_timestamp_secs(ts).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "invalid segment segment header")
+        })
     }
 
     pub fn sealed_at(&self) -> i64 {
@@ -62,22 +67,22 @@ impl FileHeader {
         u32::from_le(self.entries_count)
     }
 
-    pub fn blob_id(&self) -> Uuid {
-        Uuid::from_bytes(self.blob_id)
+    pub fn segment_id(&self) -> Uuid {
+        Uuid::from_bytes(self.segment_id)
     }
 
     pub fn validate(&self, id: Uuid) -> io::Result<()> {
-        if self.magic() != FILE_MAGIC {
+        if self.magic() != SEGMENT_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "invalid file header magic number",
+                "invalid segment header magic number",
             ));
         }
 
-        if self.blob_id() != id {
+        if self.segment_id() != id {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "file header UUID mismatch",
+                "segment header UUID mismatch",
             ));
         }
 

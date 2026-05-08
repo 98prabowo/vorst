@@ -11,7 +11,7 @@ use crate::blob::{
     format::{FLAG_NONE, FLAG_TOMBSTONE, OBJECT_HEADER_SIZE, ObjectHeader, align_to_page},
     segment::Segment,
     state::{Active, Compacted, Sealed, SegmentState},
-    types::{CompactedBlob, CompactionPlan, CompactionPolicy, ObjectLocation, ObjectOffset},
+    types::{CompactedSegment, CompactionPlan, CompactionPolicy, ObjectLocation, ObjectOffset},
 };
 
 const ACTIVE_DIR: &str = "ingestion";
@@ -296,17 +296,17 @@ impl BlobStorage {
         if let Some(active) = self.active.as_ref()
             && active.id() == *segment_id
         {
-            let (header, data) = active.read_entry(offset)?;
+            let (header, data) = active.read_object(offset)?;
             return self.process_header_result(header, data);
         }
 
         if let Some(segment) = self.sealed.get(segment_id) {
-            let (header, data) = segment.read_entry(offset)?;
+            let (header, data) = segment.read_object(offset)?;
             return self.process_header_result(header, data);
         }
 
         if let Some(segment) = self.compacted.get(segment_id) {
-            let (header, data) = segment.read_entry(offset)?;
+            let (header, data) = segment.read_object(offset)?;
             return self.process_header_result(header, data);
         }
 

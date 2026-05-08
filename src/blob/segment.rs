@@ -13,8 +13,8 @@ use uuid::Uuid;
 use crate::{
     blob::{
         format::{
-            FILE_HEADER_SIZE, FLAG_CORRUPTED, FLAG_NONE, FLAG_TOMBSTONE, FileHeader,
-            OBJECT_HEADER_SIZE, OBJECT_MAGIC, ObjectHeader, align_to_page,
+            FLAG_CORRUPTED, FLAG_NONE, FLAG_TOMBSTONE, OBJECT_HEADER_SIZE, OBJECT_MAGIC,
+            ObjectHeader, SEGMENT_HEADER_SIZE, SegmentHeader, align_to_page,
         },
         state::{Active, ImmutableSegment, Sealed, SegmentState},
         types::ObjectOffset,
@@ -24,9 +24,9 @@ use crate::{
 
 // MARK: - Storage Implementation
 
-// TODO: Implement `io_uring` support for Linux. While this is a file storage layer, the
+// TODO: Implement `io_uring` support for Linux. While this is a blob storage layer, the
 // ability to perform high-depth asynchronous reads will be critical when the application
-// needs to fetch hundreds of raw files simultaneously (e.g., during a batch export or secondary processing
+// needs to fetch hundreds of raw segmentss simultaneously (e.g., during a batch export or secondary processing
 
 pub struct Segment<S: SegmentState> {
     pub id: Uuid,
@@ -52,7 +52,7 @@ impl<S: SegmentState> Segment<S> {
         ObjectIterator::new(self, len).map(map_offset).collect()
     }
 
-    pub fn read_entry(&self, offset: u64) -> io::Result<(ObjectHeader, Vec<u8>)> {
+    pub fn read_object(&self, offset: u64) -> io::Result<(ObjectHeader, Vec<u8>)> {
         let file_len = self.file.metadata()?.len();
 
         if offset + OBJECT_HEADER_SIZE as u64 > file_len {
@@ -77,7 +77,7 @@ impl<S: SegmentState> Segment<S> {
         if offset + object_header.object_size() > file_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "object claims more data than file contains",
+                "object claims more data than segment contains",
             ));
         }
 
@@ -93,8 +93,8 @@ impl<S: SegmentState> Segment<S> {
         }
 
         // TODO: Performance Optimization - `sendfile(2)` or `mmap`. If this blob storage is
-        // serving files over a network later, look into using `sendfile` to bypass user-space
-        // copying entirely, or `mmap` for frequently accessed "hot" files.
+        // serving segments over a network later, look into using `sendfile` to bypass user-space
+        // copying entirely, or `mmap` for frequently accessed "hot" segments.
 
         Ok((object_header, data))
     }
@@ -111,13 +111,13 @@ impl<S: ImmutableSegment> Segment<S> {
             ))
         })?;
 
-        let mut file_header_bytes = AlignedBuffer::<FILE_HEADER_SIZE>::default();
-        file.read_exact_at(&mut *file_header_bytes, 0)?;
+        let mut segment_header_bytes = AlignedBuffer::<SEGMENT_HEADER_SIZE>::default();
+        file.read_exact_at(&mut *segment_header_bytes, 0)?;
 
-        let file_header: &FileHeader = bytemuck::from_bytes(&*file_header_bytes);
-        file_header.validate(id)?;
+        let segment_header: &SegmentHeader = bytemuck::from_bytes(&*segment_header_bytes);
+        segment_header.validate(id)?;
 
-        let created_at = file_header.created_at()?;
+        let created_at = segment_header.created_at()?;
 
         Ok(Self {
             id,
@@ -145,12 +145,12 @@ impl Segment<Active> {
         file.try_lock_exclusive().map_err(|_| {
             io::Error::new(
                 io::ErrorKind::AddrInUse,
-                format!("Blob is already locked by another process: {:?}", path),
+                format!("segment is already locked by another process: {:?}", path),
             )
         })?;
 
-        let header = FileHeader::new(id, 0, capacity, now);
-        file.write_all_at(bytemuck::bytes_of(&header), 0)?;
+        let segment_header = SegmentHeader::new(id, 0, capacity, now);
+        file.write_all_at(bytemuck::bytes_of(&segment_header), 0)?;
 
         preallocate(&file, capacity)?;
         file.sync_all()?;
@@ -184,13 +184,13 @@ impl Segment<Active> {
             )
         })?;
 
-        let mut file_header_bytes = AlignedBuffer::<FILE_HEADER_SIZE>::default();
-        file.read_exact_at(&mut *file_header_bytes, 0)?;
-        let file_header: &FileHeader = bytemuck::from_bytes(&*file_header_bytes);
-        file_header.validate(id)?;
+        let mut segment_header_bytes = AlignedBuffer::<SEGMENT_HEADER_SIZE>::default();
+        file.read_exact_at(&mut *segment_header_bytes, 0)?;
+        let segment_header: &SegmentHeader = bytemuck::from_bytes(&*segment_header_bytes);
+        segment_header.validate(id)?;
 
-        let capacity = file_header.capacity();
-        let created_at = file_header.created_at()?;
+        let capacity = segment_header.capacity();
+        let created_at = segment_header.created_at()?;
 
         let mut segment = Self {
             id,
@@ -208,7 +208,7 @@ impl Segment<Active> {
         let object_offsets = segment.scan_offsets()?;
 
         if let Some(last_object) = object_offsets.last() {
-            match segment.read_entry(last_object.offset) {
+            match segment.read_object(last_object.offset) {
                 Ok((header, _data)) => {
                     let next_pos =
                         align_to_page(last_object.offset + header.object_size(), page_size);
@@ -287,11 +287,11 @@ impl Segment<Active> {
     pub fn seal(self) -> io::Result<Segment<Sealed>> {
         // TODO: Implement a "Manifest" or "Control File." Currently, the existence of a
         // `.blob` file is the only record of its validity. A manifest would track all active,
-        // sealed, and compacted segments atomically, preventing orphan files after a crash
+        // sealed, and compacted segments atomically, preventing orphan segments after a crash
         // during compaction.
 
-        FileHeader::write_sealed_at(&self.file, Utc::now())?;
-        FileHeader::write_entries_count(&self.file, self.state.entries_count)?;
+        SegmentHeader::write_sealed_at(&self.file, Utc::now())?;
+        SegmentHeader::write_entries_count(&self.file, self.state.entries_count)?;
 
         let final_size = self.state.write_cursor;
         self.file.set_len(final_size)?; // Trim preallocation

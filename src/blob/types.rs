@@ -20,14 +20,14 @@ pub struct ObjectOffset {
 
 pub struct CompactionMap {
     pub object_id: u64,
-    pub old_blob_id: Uuid,
+    pub old_segment_id: Uuid,
     pub old_offset: u64,
     pub new_offset: u64,
 }
 
-pub struct CompactedBlob {
-    pub new_blob: Segment<Compacted>,
-    pub removed_blob_ids: Vec<Uuid>,
+pub struct CompactedSegment {
+    pub new_segment: Segment<Compacted>,
+    pub removed_segment_ids: Vec<Uuid>,
     pub removed_paths: Vec<PathBuf>,
 }
 

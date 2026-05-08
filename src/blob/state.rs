@@ -1,5 +1,3 @@
-use std::io;
-
 use crate::blob::types::CompactionMap;
 
 pub trait SegmentState: Default {}
