@@ -8,8 +8,8 @@ use uuid::Uuid;
 
 use crate::blob::{
     compaction::BlobCompactable,
-    format::{OBJECT_HEADER_SIZE, ObjectHeader},
-    segment::{FLAG_NONE, FLAG_TOMBSTONE, Segment, align_to_page},
+    format::{OBJECT_HEADER_SIZE, ObjectHeader, align_to_page},
+    segment::{FLAG_NONE, FLAG_TOMBSTONE, Segment},
     state::{Active, Compacted, Sealed},
     types::{CompactedBlob, CompactionPlan, CompactionPolicy, ObjectOffset},
 };
