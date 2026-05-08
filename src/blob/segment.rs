@@ -235,19 +235,19 @@ impl Segment<Active> {
             .collect()
     }
 
-    pub fn ingest(&mut self, id: u64, data: &[u8]) -> io::Result<u64> {
+    pub fn ingest(&mut self, id: Uuid, data: &[u8]) -> io::Result<u64> {
         self.ingest_with_flags(id, data, FLAG_NONE)
     }
 
-    pub fn delete(&mut self, id: u64) -> io::Result<u64> {
+    pub fn delete(&mut self, id: Uuid) -> io::Result<u64> {
         self.ingest_with_flags(id, &[], FLAG_TOMBSTONE)
     }
 
-    pub fn corrupted(&mut self, id: u64) -> io::Result<u64> {
+    pub fn corrupted(&mut self, id: Uuid) -> io::Result<u64> {
         self.ingest_with_flags(id, &[], FLAG_CORRUPTED)
     }
 
-    fn ingest_with_flags(&mut self, id: u64, data: &[u8], flags: u16) -> io::Result<u64> {
+    fn ingest_with_flags(&mut self, id: Uuid, data: &[u8], flags: u16) -> io::Result<u64> {
         // FIXME: Implement a write-ahead log (WAL) or a "commit" bit for individual
         // objects. Currently, if the process crashes mid-write, a partial object might exist
         // that passes the magic number check but contains garbage data.

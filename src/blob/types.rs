@@ -13,13 +13,13 @@ pub struct ObjectLocation {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectOffset {
-    pub object_id: u64,
+    pub object_id: Uuid,
     pub offset: u64,
     pub flags: u16,
 }
 
 pub struct CompactionMap {
-    pub object_id: u64,
+    pub object_id: Uuid,
     pub old_segment_id: Uuid,
     pub old_offset: u64,
     pub new_offset: u64,

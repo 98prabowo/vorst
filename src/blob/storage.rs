@@ -29,7 +29,7 @@ pub struct BlobStorage {
     capacity: u64,
     page_size: u64,
     compaction_policy: CompactionPolicy,
-    index: HashMap<u64, ObjectLocation>,
+    object_indexes: HashMap<Uuid, ObjectLocation>,
 }
 
 // MARK: - Open
@@ -47,14 +47,14 @@ impl BlobStorage {
         let layout = StorageLayout::new(base_dir);
         layout.initialize()?;
 
-        let mut index = HashMap::new();
+        let mut object_indexes = HashMap::new();
 
         let compacted_paths = Self::scan_segments(layout.compacted_dir(), "blob")?;
         let mut compacted = HashMap::with_capacity(compacted_paths.len());
         for path in compacted_paths {
             let segment_id = Self::path_id(&path)?;
             let segment = Segment::<Compacted>::open_readonly(segment_id, path, page_size)?;
-            Self::populate_index(&mut index, &segment)?;
+            Self::populate_index(&mut object_indexes, &segment)?;
             compacted.insert(segment.id(), segment);
         }
 
@@ -63,7 +63,7 @@ impl BlobStorage {
         for path in sealed_paths {
             let segment_id = Self::path_id(&path)?;
             let segment = Segment::<Sealed>::open_readonly(segment_id, path, page_size)?;
-            Self::populate_index(&mut index, &segment)?;
+            Self::populate_index(&mut object_indexes, &segment)?;
             sealed.insert(segment.id(), segment);
         }
 
@@ -75,7 +75,7 @@ impl BlobStorage {
         if let Some(last_path) = active_paths.pop() {
             let id = Self::path_id(&last_path)?;
             let segment = Segment::<Active>::open(id, last_path, page_size)?;
-            Self::populate_index(&mut index, &segment)?;
+            Self::populate_index(&mut object_indexes, &segment)?;
             active = Some(segment);
 
             for zombie_path in active_paths {
@@ -89,7 +89,7 @@ impl BlobStorage {
                 fs::rename(&sealed_segment.path, &sealed_path)?;
 
                 sealed_segment.path = sealed_path;
-                Self::populate_index(&mut index, &sealed_segment)?;
+                Self::populate_index(&mut object_indexes, &sealed_segment)?;
                 sealed.insert(id, sealed_segment);
             }
         }
@@ -102,7 +102,7 @@ impl BlobStorage {
             capacity,
             page_size,
             compaction_policy,
-            index,
+            object_indexes,
         })
     }
 
@@ -160,7 +160,7 @@ impl BlobStorage {
     }
 
     fn populate_index<S>(
-        index: &mut HashMap<u64, ObjectLocation>,
+        indexes: &mut HashMap<Uuid, ObjectLocation>,
         segment: &Segment<S>,
     ) -> io::Result<()>
     where
@@ -170,7 +170,7 @@ impl BlobStorage {
         let segment_id = segment.id;
 
         for offset in offsets {
-            index.insert(offset.object_id, ObjectLocation { segment_id, offset });
+            indexes.insert(offset.object_id, ObjectLocation { segment_id, offset });
         }
 
         Ok(())
@@ -180,7 +180,7 @@ impl BlobStorage {
 // MARK: - Put
 
 impl BlobStorage {
-    pub fn put(&mut self, object_id: u64, data: &[u8]) -> io::Result<ObjectOffset> {
+    pub fn put(&mut self, object_id: Uuid, data: &[u8]) -> io::Result<ObjectOffset> {
         let total_needed = align_to_page(
             OBJECT_HEADER_SIZE as u64 + data.len() as u64,
             self.page_size,
@@ -216,7 +216,7 @@ impl BlobStorage {
                     flags: FLAG_NONE,
                 };
 
-                self.index.insert(
+                self.object_indexes.insert(
                     object_id,
                     ObjectLocation {
                         segment_id: active.id(),
@@ -235,7 +235,7 @@ impl BlobStorage {
 
     fn rotate_and_put(
         &mut self,
-        object_id: u64,
+        object_id: Uuid,
         data: &[u8],
         flags: u16,
     ) -> io::Result<ObjectOffset> {
@@ -267,7 +267,7 @@ impl BlobStorage {
 
         let offset = next_active.ingest(object_id, data)?;
 
-        self.index.insert(
+        self.object_indexes.insert(
             object_id,
             ObjectLocation {
                 segment_id: new_id,
@@ -327,7 +327,7 @@ impl BlobStorage {
 // MARK: - Delete
 
 impl BlobStorage {
-    pub fn delete(&mut self, object_id: u64) -> io::Result<ObjectOffset> {
+    pub fn delete(&mut self, object_id: Uuid) -> io::Result<ObjectOffset> {
         if self.active.is_none() {
             let id = Uuid::now_v7();
             let path = self.layout.path_for(id).active().build();
