@@ -9,6 +9,10 @@ pub const FILE_HEADER_SIZE: usize = size_of::<FileHeader>();
 pub const OBJECT_MAGIC: u32 = 0x564F424A; // "VOBJ"
 pub const OBJECT_HEADER_SIZE: usize = size_of::<ObjectHeader>();
 
+pub const FLAG_NONE: u16 = 0x0000;
+pub const FLAG_TOMBSTONE: u16 = 0x0001;
+pub const FLAG_CORRUPTED: u16 = 0x0002;
+
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Pod, Zeroable)]
 pub struct FileHeader {

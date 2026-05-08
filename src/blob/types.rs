@@ -5,6 +5,13 @@ use uuid::Uuid;
 
 use crate::blob::{segment::Segment, state::Compacted};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectLocation {
+    pub segment_id: Uuid,
+    pub offset: ObjectOffset,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectOffset {
     pub object_id: u64,
     pub offset: u64,

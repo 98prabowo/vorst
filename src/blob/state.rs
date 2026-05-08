@@ -1,7 +1,9 @@
+use std::io;
+
 use crate::blob::types::CompactionMap;
 
-pub trait BlobState: Default {}
-pub trait ImmutableBlob: BlobState {}
+pub trait SegmentState: Default {}
+pub trait ImmutableSegment: SegmentState {}
 
 #[derive(Default)]
 pub struct Active {
@@ -18,9 +20,9 @@ pub struct Compacted {
     pub mappings: Vec<CompactionMap>,
 }
 
-impl BlobState for Active {}
-impl BlobState for Sealed {}
-impl BlobState for Compacted {}
+impl SegmentState for Active {}
+impl SegmentState for Sealed {}
+impl SegmentState for Compacted {}
 
-impl ImmutableBlob for Sealed {}
-impl ImmutableBlob for Compacted {}
+impl ImmutableSegment for Sealed {}
+impl ImmutableSegment for Compacted {}
