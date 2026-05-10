@@ -1,4 +1,5 @@
 use std::{
+    any::TypeId,
     collections::HashMap,
     fs, io,
     path::{Path, PathBuf},
@@ -8,10 +9,15 @@ use uuid::Uuid;
 
 use crate::blob::{
     // compaction::BlobCompactable,
-    format::{FLAG_NONE, FLAG_TOMBSTONE, OBJECT_HEADER_SIZE, ObjectHeader, align_to_page},
+    cache::FileCachePool,
+    format::{FLAG_NONE, FLAG_TOMBSTONE, OBJECT_HEADER_SIZE, ObjectHeader},
     segment::Segment,
-    state::{Active, Compacted, Sealed, SegmentState},
-    types::{CompactedSegment, CompactionPlan, CompactionPolicy, ObjectLocation, ObjectOffset},
+    state::{Active, Compacted, ImmutableSegment, Sealed},
+    types::{
+        CompactedSegment, CompactionPlan, CompactionPolicy, IngestedObject, ObjectLocation,
+        ObjectOffset,
+    },
+    utils::align_to_page,
 };
 
 const ACTIVE_DIR: &str = "ingestion";
@@ -26,10 +32,10 @@ pub struct BlobStorage {
     active: Option<Segment<Active>>,
     sealed: HashMap<Uuid, Segment<Sealed>>,
     compacted: HashMap<Uuid, Segment<Compacted>>,
+    file_cache: FileCachePool,
     capacity: u64,
     page_size: u64,
     compaction_policy: CompactionPolicy,
-    object_indexes: HashMap<Uuid, ObjectLocation>,
 }
 
 // MARK: - Open
@@ -39,6 +45,8 @@ impl BlobStorage {
         base_dir: P,
         capacity: u64,
         page_size: u64,
+        file_pool_count: u32,
+        file_pool_capacity: u32,
         compaction_policy: CompactionPolicy,
     ) -> io::Result<Self>
     where
@@ -47,25 +55,10 @@ impl BlobStorage {
         let layout = StorageLayout::new(base_dir);
         layout.initialize()?;
 
-        let mut object_indexes = HashMap::new();
+        let file_cache = FileCachePool::new(file_pool_count as usize, file_pool_capacity as usize)?;
 
-        let compacted_paths = Self::scan_segments(layout.compacted_dir(), "blob")?;
-        let mut compacted = HashMap::with_capacity(compacted_paths.len());
-        for path in compacted_paths {
-            let segment_id = Self::path_id(&path)?;
-            let segment = Segment::<Compacted>::open_readonly(segment_id, path, page_size)?;
-            Self::populate_index(&mut object_indexes, &segment)?;
-            compacted.insert(segment.id(), segment);
-        }
-
-        let sealed_paths = Self::scan_segments(layout.sealed_dir(), "blob")?;
-        let mut sealed = HashMap::with_capacity(sealed_paths.len());
-        for path in sealed_paths {
-            let segment_id = Self::path_id(&path)?;
-            let segment = Segment::<Sealed>::open_readonly(segment_id, path, page_size)?;
-            Self::populate_index(&mut object_indexes, &segment)?;
-            sealed.insert(segment.id(), segment);
-        }
+        let compacted = Self::hydrate_descriptors::<Compacted>(&layout, page_size)?;
+        let mut sealed = Self::hydrate_descriptors::<Sealed>(&layout, page_size)?;
 
         let mut active_paths = Self::scan_segments(layout.active_dir(), "tmp")?;
         active_paths.sort_by_key(|p| Self::path_id(p).unwrap_or_default());
@@ -75,7 +68,6 @@ impl BlobStorage {
         if let Some(last_path) = active_paths.pop() {
             let id = Self::path_id(&last_path)?;
             let segment = Segment::<Active>::open(id, last_path, page_size)?;
-            Self::populate_index(&mut object_indexes, &segment)?;
             active = Some(segment);
 
             for zombie_path in active_paths {
@@ -89,7 +81,6 @@ impl BlobStorage {
                 fs::rename(&sealed_segment.path, &sealed_path)?;
 
                 sealed_segment.path = sealed_path;
-                Self::populate_index(&mut object_indexes, &sealed_segment)?;
                 sealed.insert(id, sealed_segment);
             }
         }
@@ -99,11 +90,33 @@ impl BlobStorage {
             active,
             sealed,
             compacted,
+            file_cache,
             capacity,
             page_size,
             compaction_policy,
-            object_indexes,
         })
+    }
+
+    fn hydrate_descriptors<S: ImmutableSegment + 'static>(
+        layout: &StorageLayout,
+        page_size: u64,
+    ) -> io::Result<HashMap<Uuid, Segment<S>>> {
+        let dir = if TypeId::of::<S>() == TypeId::of::<Compacted>() {
+            layout.compacted_dir()
+        } else {
+            layout.sealed_dir()
+        };
+
+        let paths = Self::scan_segments(dir, "blob")?;
+        let mut map = HashMap::with_capacity(paths.len());
+
+        for path in paths {
+            let id = Self::path_id(&path)?;
+            let segment = Segment::<S>::open_readonly(id, path, page_size)?;
+            map.insert(id, segment);
+        }
+
+        Ok(map)
     }
 
     fn scan_segments<P>(root: P, extension: &str) -> io::Result<Vec<PathBuf>>
@@ -158,29 +171,12 @@ impl BlobStorage {
             )
         })
     }
-
-    fn populate_index<S>(
-        indexes: &mut HashMap<Uuid, ObjectLocation>,
-        segment: &Segment<S>,
-    ) -> io::Result<()>
-    where
-        S: SegmentState,
-    {
-        let offsets = segment.scan_offsets()?;
-        let segment_id = segment.id;
-
-        for offset in offsets {
-            indexes.insert(offset.object_id, ObjectLocation { segment_id, offset });
-        }
-
-        Ok(())
-    }
 }
 
 // MARK: - Put
 
 impl BlobStorage {
-    pub fn put(&mut self, object_id: Uuid, data: &[u8]) -> io::Result<ObjectOffset> {
+    pub fn put(&mut self, object_id: Uuid, data: &[u8]) -> io::Result<ObjectLocation> {
         let total_needed = align_to_page(
             OBJECT_HEADER_SIZE as u64 + data.len() as u64,
             self.page_size,
@@ -209,22 +205,23 @@ impl BlobStorage {
             .ok_or_else(|| io::Error::other("active segment lost during initialization"))?;
 
         match active.ingest(object_id, data) {
-            Ok(offset) => {
-                let object_offset = ObjectOffset {
-                    object_id,
-                    offset,
-                    flags: FLAG_NONE,
+            Ok(IngestedObject {
+                offset,
+                length,
+                checksum,
+            }) => {
+                let object_location = ObjectLocation {
+                    segment_id: active.id(),
+                    object_offset: ObjectOffset {
+                        object_id,
+                        offset,
+                        flags: FLAG_NONE,
+                    },
+                    length,
+                    checksum,
                 };
 
-                self.object_indexes.insert(
-                    object_id,
-                    ObjectLocation {
-                        segment_id: active.id(),
-                        offset: object_offset,
-                    },
-                );
-
-                Ok(object_offset)
+                Ok(object_location)
             }
             Err(e) if e.kind() == io::ErrorKind::StorageFull => {
                 self.rotate_and_put(object_id, data, FLAG_NONE)
@@ -238,7 +235,7 @@ impl BlobStorage {
         object_id: Uuid,
         data: &[u8],
         flags: u16,
-    ) -> io::Result<ObjectOffset> {
+    ) -> io::Result<ObjectLocation> {
         let old_active = self
             .active
             .take()
@@ -265,27 +262,26 @@ impl BlobStorage {
         let mut next_active =
             Segment::<Active>::new(new_id, new_path, self.capacity, self.page_size)?;
 
-        let offset = next_active.ingest(object_id, data)?;
+        let IngestedObject {
+            offset,
+            length,
+            checksum,
+        } = next_active.ingest(object_id, data)?;
 
-        self.object_indexes.insert(
-            object_id,
-            ObjectLocation {
-                segment_id: new_id,
-                offset: ObjectOffset {
-                    object_id,
-                    offset,
-                    flags,
-                },
+        let object_location = ObjectLocation {
+            segment_id: new_id,
+            object_offset: ObjectOffset {
+                object_id,
+                offset,
+                flags,
             },
-        );
+            length,
+            checksum,
+        };
 
         self.active = Some(next_active);
 
-        Ok(ObjectOffset {
-            object_id,
-            offset,
-            flags,
-        })
+        Ok(object_location)
     }
 }
 
@@ -296,17 +292,19 @@ impl BlobStorage {
         if let Some(active) = self.active.as_ref()
             && active.id() == *segment_id
         {
-            let (header, data) = active.read_object(offset)?;
+            let (header, data) = active.read_object_at(&active.state.file, offset)?;
             return self.process_header_result(header, data);
         }
 
         if let Some(segment) = self.sealed.get(segment_id) {
-            let (header, data) = segment.read_object(offset)?;
+            let cached_file = self.file_cache.get(*segment_id, &segment.path)?;
+            let (header, data) = segment.read_object_at(&cached_file, offset)?;
             return self.process_header_result(header, data);
         }
 
         if let Some(segment) = self.compacted.get(segment_id) {
-            let (header, data) = segment.read_object(offset)?;
+            let cached_file = self.file_cache.get(*segment_id, &segment.path)?;
+            let (header, data) = segment.read_object_at(&cached_file, offset)?;
             return self.process_header_result(header, data);
         }
 
@@ -327,7 +325,7 @@ impl BlobStorage {
 // MARK: - Delete
 
 impl BlobStorage {
-    pub fn delete(&mut self, object_id: Uuid) -> io::Result<ObjectOffset> {
+    pub fn delete(&mut self, object_id: Uuid) -> io::Result<ObjectLocation> {
         if self.active.is_none() {
             let id = Uuid::now_v7();
             let path = self.layout.path_for(id).active().build();
@@ -344,18 +342,23 @@ impl BlobStorage {
             .as_mut()
             .ok_or_else(|| io::Error::other("active segment lost during deletion"))?;
 
-        let offset = match active.delete(object_id) {
-            Ok(off) => off,
+        let ingested = match active.delete(object_id) {
+            Ok(ingested) => ingested,
             Err(e) if e.kind() == io::ErrorKind::StorageFull => {
                 return self.rotate_and_put(object_id, &[], FLAG_TOMBSTONE);
             }
             Err(e) => return Err(e),
         };
 
-        Ok(ObjectOffset {
-            object_id,
-            offset,
-            flags: FLAG_TOMBSTONE,
+        Ok(ObjectLocation {
+            segment_id: active.id(),
+            object_offset: ObjectOffset {
+                object_id,
+                offset: ingested.offset,
+                flags: FLAG_TOMBSTONE,
+            },
+            length: ingested.length,
+            checksum: ingested.checksum,
         })
     }
 }

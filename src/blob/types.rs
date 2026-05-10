@@ -8,7 +8,9 @@ use crate::blob::{segment::Segment, state::Compacted};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectLocation {
     pub segment_id: Uuid,
-    pub offset: ObjectOffset,
+    pub object_offset: ObjectOffset,
+    pub length: u32,
+    pub checksum: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -51,4 +53,10 @@ impl Default for CompactionPolicy {
             min_interval: Duration::seconds(3600),
         }
     }
+}
+
+pub struct IngestedObject {
+    pub offset: u64,
+    pub length: u32,
+    pub checksum: u32,
 }

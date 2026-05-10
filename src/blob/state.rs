@@ -1,13 +1,15 @@
+use std::fs::File;
+
 use crate::blob::types::CompactionMap;
 
-pub trait SegmentState: Default {}
-pub trait ImmutableSegment: SegmentState {}
+pub trait SegmentState {}
+pub trait ImmutableSegment: SegmentState + Default {}
 
-#[derive(Default)]
 pub struct Active {
     pub capacity: u64,
     pub entries_count: u32,
     pub write_cursor: u64,
+    pub file: File,
 }
 
 #[derive(Default)]
