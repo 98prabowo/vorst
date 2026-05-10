@@ -3,7 +3,10 @@ use std::sync::Arc;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use uuid::Uuid;
 
-use crate::blob::{ObjectLocation, ObjectOffset};
+use crate::{
+    blob::{ObjectLocation, ObjectOffset},
+    metadata::error::{Error, Result},
+};
 
 type RawUuid = [u8; 16];
 type RawObjectLocation = (RawUuid, u64, u16, u32, u32); // (Segment ID, Offset, Flags, Length, Checksum)
@@ -24,7 +27,7 @@ pub struct MetadataStorage {
 }
 
 impl MetadataStorage {
-    pub fn open(path: &str) -> Result<Self, redb::Error> {
+    pub fn open(path: &str) -> Result<Self> {
         let db = Database::create(path)?;
 
         let write_tx = db.begin_write()?;
@@ -42,7 +45,7 @@ impl MetadataStorage {
         file_id: Uuid,
         chunk_idx: u32,
         location: ObjectLocation,
-    ) -> Result<(), redb::Error> {
+    ) -> Result<()> {
         let write_tx = self.db.begin_write()?;
         {
             let mut obj_table = write_tx.open_table(OBJECT_TABLE)?;
@@ -68,7 +71,7 @@ impl MetadataStorage {
         &self,
         file_id: Uuid,
         chunks: Vec<ObjectLocation>,
-    ) -> Result<(), redb::Error> {
+    ) -> Result<()> {
         let write_tx = self.db.begin_write()?;
         {
             let mut obj_table = write_tx.open_table(OBJECT_TABLE)?;
@@ -92,10 +95,7 @@ impl MetadataStorage {
         Ok(())
     }
 
-    pub fn update_locations(
-        &self,
-        updates: Vec<(Uuid, ObjectLocation)>,
-    ) -> Result<(), redb::Error> {
+    pub fn update_locations(&self, updates: Vec<(Uuid, ObjectLocation)>) -> Result<()> {
         let write_tx = self.db.begin_write()?;
         {
             let mut obj_table = write_tx.open_table(OBJECT_TABLE)?;
@@ -114,7 +114,7 @@ impl MetadataStorage {
         Ok(())
     }
 
-    pub fn delete_file(&self, file_id: Uuid) -> Result<Vec<Uuid>, redb::Error> {
+    pub fn delete_file(&self, file_id: Uuid) -> Result<Vec<Uuid>> {
         let write_tx = self.db.begin_write()?;
         let mut deleted_objects = Vec::new();
         {
@@ -134,11 +134,16 @@ impl MetadataStorage {
                 }
             }
         }
+
+        if deleted_objects.is_empty() {
+            return Err(Error::FileNotFound(file_id));
+        }
+
         write_tx.commit()?;
         Ok(deleted_objects)
     }
 
-    pub fn get_file_object_ids(&self, file_id: Uuid) -> Result<Vec<Uuid>, redb::Error> {
+    pub fn get_file_object_ids(&self, file_id: Uuid) -> Result<Vec<Uuid>> {
         let read_tx = self.db.begin_read()?;
         let file_table = read_tx.open_table(FILE_TABLE)?;
 
@@ -156,35 +161,29 @@ impl MetadataStorage {
         Ok(object_ids)
     }
 
-    pub fn get_object_location(
-        &self,
-        object_id: Uuid,
-    ) -> Result<Option<ObjectLocation>, redb::Error> {
+    pub fn get_object_location(&self, object_id: Uuid) -> Result<ObjectLocation> {
         let read_tx = self.db.begin_read()?;
         let table = read_tx.open_table(OBJECT_TABLE)?;
-        let result = table
-            .get(object_id.into_bytes())?
-            .map(|g| g.value())
-            .map(|loc| ObjectLocation {
-                segment_id: Uuid::from_bytes(loc.0),
-                object_offset: ObjectOffset {
-                    object_id,
-                    offset: loc.1,
-                    flags: loc.2,
-                },
-                length: loc.3,
-                checksum: loc.4,
-            });
 
-        Ok(result)
+        let guard = table
+            .get(object_id.into_bytes())?
+            .ok_or(Error::ObjectNotFound(object_id))?;
+
+        let loc = guard.value();
+
+        Ok(ObjectLocation {
+            segment_id: Uuid::from_bytes(loc.0),
+            object_offset: ObjectOffset {
+                object_id,
+                offset: loc.1,
+                flags: loc.2,
+            },
+            length: loc.3,
+            checksum: loc.4,
+        })
     }
 
-    pub fn check_liveliness(
-        &self,
-        object_id: Uuid,
-        segment_id: Uuid,
-        offset: u64,
-    ) -> Result<bool, redb::Error> {
+    pub fn check_liveliness(&self, object_id: Uuid, segment_id: Uuid, offset: u64) -> Result<bool> {
         let read_tx = self.db.begin_read()?;
         let table = read_tx.open_table(OBJECT_TABLE)?;
 

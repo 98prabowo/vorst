@@ -50,6 +50,7 @@ pub enum Error {
     #[error("Invalid timestamp in segment header")]
     InvalidTimestamp,
 
+    // --- Internal Errors ---
     #[error("Internal coordinator error: {0}")]
     Internal(String),
 }
