@@ -9,4 +9,3 @@ mod utils;
 
 pub use storage::BlobStorage;
 pub use types::{CompactionPolicy, ObjectLocation, ObjectOffset};
-pub use utils::BlobHasher;

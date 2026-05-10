@@ -1,4 +1,5 @@
 mod blob;
+mod engine;
 mod id;
 mod metadata;
 mod sys;
