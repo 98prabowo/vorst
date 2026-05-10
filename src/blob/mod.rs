@@ -8,5 +8,6 @@ mod storage;
 mod types;
 mod utils;
 
+pub use error::Error;
 pub use storage::BlobStorage;
 pub use types::{CompactionPolicy, ObjectLocation, ObjectOffset};

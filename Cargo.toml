@@ -31,7 +31,6 @@ axum        = "0.8"
 tonic       = "0.14"
 
 # Utilities
-anyhow      = "1.0"
 crc32fast   = "1.5"
 chrono      = "0.4"
 libc        = "0.2"

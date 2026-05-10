@@ -1,9 +1,8 @@
-use std::io;
-
 use uuid::Uuid;
 
 use crate::{
     blob::{BlobStorage, CompactionPolicy},
+    error::Result,
     metadata::MetadataStorage,
 };
 
@@ -43,9 +42,8 @@ pub struct StorageCoordinator {
 }
 
 impl StorageCoordinator {
-    pub fn open(config: StorageConfig, page_size: u64) -> anyhow::Result<Self> {
-        let metadata = MetadataStorage::open(&config.metadata_path)
-            .map_err(|e| anyhow::anyhow!("Failed to open metadata: {}", e))?;
+    pub fn open(config: StorageConfig, page_size: u64) -> Result<Self> {
+        let metadata = MetadataStorage::open(&config.metadata_path)?;
 
         let blob = BlobStorage::open(
             &config.blob_base_dir,
@@ -54,8 +52,7 @@ impl StorageCoordinator {
             config.file_pool_count,
             config.file_pool_capacity,
             CompactionPolicy::default(),
-        )
-        .map_err(|e| anyhow::anyhow!("Failed to open blob storage: {}", e))?;
+        )?;
 
         Ok(Self {
             metadata,
@@ -64,7 +61,7 @@ impl StorageCoordinator {
         })
     }
 
-    pub fn put_file(&mut self, file_id: Uuid, mut data: &[u8]) -> anyhow::Result<()> {
+    pub fn put_file(&mut self, file_id: Uuid, mut data: &[u8]) -> Result<()> {
         let mut chunks = Vec::new();
 
         while !data.is_empty() {
@@ -84,7 +81,7 @@ impl StorageCoordinator {
         Ok(())
     }
 
-    pub fn get_file(&self, file_id: Uuid) -> anyhow::Result<Vec<u8>> {
+    pub fn get_file(&self, file_id: Uuid) -> Result<Vec<u8>> {
         let object_ids = self.metadata.get_file_object_ids(file_id)?;
 
         if object_ids.is_empty() {
@@ -94,10 +91,7 @@ impl StorageCoordinator {
         let mut file_data = Vec::new();
 
         for object_id in object_ids {
-            let location = self
-                .metadata
-                .get_object_location(object_id)?
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "chunk metadata missing"))?;
+            let location = self.metadata.get_object_location(object_id)?;
 
             let chunk_data = self
                 .blob
@@ -109,7 +103,7 @@ impl StorageCoordinator {
         Ok(file_data)
     }
 
-    pub fn delete_file(&mut self, file_id: Uuid) -> anyhow::Result<()> {
+    pub fn delete_file(&mut self, file_id: Uuid) -> Result<()> {
         let object_ids = self.metadata.delete_file(file_id)?;
 
         for object_id in object_ids {
