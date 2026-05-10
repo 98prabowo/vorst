@@ -1,5 +1,6 @@
 mod cache;
 mod compaction;
+mod error;
 mod format;
 mod segment;
 mod state;

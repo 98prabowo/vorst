@@ -1,8 +1,13 @@
-use std::{fs::File, io, mem::offset_of, os::unix::fs::FileExt};
+use std::{fs::File, mem::offset_of, os::unix::fs::FileExt};
 
 use bytemuck::{Pod, Zeroable};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
+
+use crate::blob::{
+    error::{Error, Result},
+    utils::AlignedBuffer,
+};
 
 // "VBSF" (Vorst Blob Segment Format)
 pub const SEGMENT_MAGIC: u32 = 0x56425346;
@@ -52,11 +57,9 @@ impl SegmentHeader {
         u64::from_le(self.capacity)
     }
 
-    pub fn created_at(&self) -> io::Result<DateTime<Utc>> {
+    pub fn created_at(&self) -> Result<DateTime<Utc>> {
         let ts = i64::from_le(self.created_at);
-        DateTime::from_timestamp_secs(ts).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidData, "invalid segment segment header")
-        })
+        DateTime::from_timestamp_secs(ts).ok_or(Error::InvalidTimestamp)
     }
 
     pub fn sealed_at(&self) -> i64 {
@@ -71,33 +74,45 @@ impl SegmentHeader {
         Uuid::from_bytes(self.segment_id)
     }
 
-    pub fn validate(&self, id: Uuid) -> io::Result<()> {
+    pub fn validate(&self, id: Uuid) -> Result<()> {
         if self.magic() != SEGMENT_MAGIC {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "invalid segment header magic number",
-            ));
+            return Err(Error::InvalidMagic {
+                expected: SEGMENT_MAGIC,
+                found: self.magic(),
+            });
         }
 
         if self.segment_id() != id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "segment header UUID mismatch",
-            ));
+            return Err(Error::IdMismatch {
+                expected: id,
+                found: self.segment_id(),
+            });
         }
 
         Ok(())
     }
 
-    pub fn write_sealed_at(file: &File, dt: DateTime<Utc>) -> io::Result<()> {
-        let offset = offset_of!(Self, sealed_at) as u64;
-        let ts = dt.timestamp();
-        file.write_all_at(&ts.to_le_bytes(), offset)
+    pub fn header(file: &File, segment_id: Uuid) -> Result<Self> {
+        let mut buf = AlignedBuffer::<{ size_of::<Self>() }>::default();
+        file.read_exact_at(&mut *buf, 0)?;
+
+        let header: Self = *bytemuck::from_bytes(&*buf);
+        header.validate(segment_id)?;
+
+        Ok(header)
     }
 
-    pub fn write_entries_count(file: &File, count: u32) -> io::Result<()> {
+    pub fn write_sealed_at(file: &File, dt: DateTime<Utc>) -> Result<()> {
+        let offset = offset_of!(Self, sealed_at) as u64;
+        let ts = dt.timestamp();
+        file.write_all_at(&ts.to_le_bytes(), offset)?;
+        Ok(())
+    }
+
+    pub fn write_entries_count(file: &File, count: u32) -> Result<()> {
         let offset = offset_of!(Self, entries_count) as u64;
-        file.write_all_at(&count.to_le_bytes(), offset)
+        file.write_all_at(&count.to_le_bytes(), offset)?;
+        Ok(())
     }
 }
 
@@ -146,5 +161,29 @@ impl ObjectHeader {
 
     pub fn object_size(&self) -> u64 {
         OBJECT_HEADER_SIZE as u64 + self.data_len() as u64
+    }
+
+    pub fn header(file: &File, segment_id: Uuid, offset: u64, file_capacity: u64) -> Result<Self> {
+        let mut buf = AlignedBuffer::<{ size_of::<Self>() }>::default();
+        file.read_exact_at(&mut *buf, offset)?;
+
+        let header: Self = *bytemuck::from_bytes(&*buf);
+
+        if header.magic() != OBJECT_MAGIC {
+            return Err(Error::InvalidMagic {
+                expected: OBJECT_MAGIC,
+                found: header.magic(),
+            });
+        }
+
+        if offset + header.object_size() > file_capacity {
+            return Err(Error::OutOfBounds {
+                id: segment_id,
+                offset,
+                size: header.object_size(),
+            });
+        }
+
+        Ok(header)
     }
 }

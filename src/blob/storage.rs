@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::blob::{
     // compaction::BlobCompactable,
     cache::FileCachePool,
+    error::{Error, Result},
     format::{FLAG_NONE, FLAG_TOMBSTONE, OBJECT_HEADER_SIZE, ObjectHeader},
     segment::Segment,
     state::{Active, Compacted, ImmutableSegment, Sealed},
@@ -48,7 +49,7 @@ impl BlobStorage {
         file_pool_count: u32,
         file_pool_capacity: u32,
         compaction_policy: CompactionPolicy,
-    ) -> io::Result<Self>
+    ) -> Result<Self>
     where
         P: AsRef<Path>,
     {
@@ -100,7 +101,7 @@ impl BlobStorage {
     fn hydrate_descriptors<S: ImmutableSegment + 'static>(
         layout: &StorageLayout,
         page_size: u64,
-    ) -> io::Result<HashMap<Uuid, Segment<S>>> {
+    ) -> Result<HashMap<Uuid, Segment<S>>> {
         let dir = if TypeId::of::<S>() == TypeId::of::<Compacted>() {
             layout.compacted_dir()
         } else {
@@ -119,7 +120,7 @@ impl BlobStorage {
         Ok(map)
     }
 
-    fn scan_segments<P>(root: P, extension: &str) -> io::Result<Vec<PathBuf>>
+    fn scan_segments<P>(root: P, extension: &str) -> Result<Vec<PathBuf>>
     where
         P: AsRef<Path>,
     {
@@ -144,7 +145,7 @@ impl BlobStorage {
         Ok(paths)
     }
 
-    fn path_id<P>(path: P) -> io::Result<Uuid>
+    fn path_id<P>(path: P) -> Result<Uuid>
     where
         P: AsRef<Path>,
     {
@@ -152,40 +153,31 @@ impl BlobStorage {
             .as_ref()
             .file_name()
             .and_then(|n| n.to_str())
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid filename"))?;
+            .ok_or_else(|| Error::Internal("invalid filename".to_string()))?;
 
         let id_str = file_name
             .strip_prefix(SEGMENT_PREFIX)
             .and_then(|s| s.split('.').next())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("format mismatch: {}", file_name),
-                )
-            })?;
+            .ok_or_else(|| Error::Internal(format!("format mismatch: {}", file_name)))?;
 
-        id_str.parse::<Uuid>().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("invalid UUID: {}", id_str),
-            )
-        })
+        id_str
+            .parse::<Uuid>()
+            .map_err(|_| Error::Internal(format!("invalid UUID: {}", id_str)))
     }
 }
 
 // MARK: - Put
 
 impl BlobStorage {
-    pub fn put(&mut self, object_id: Uuid, data: &[u8]) -> io::Result<ObjectLocation> {
+    pub fn put(&mut self, object_id: Uuid, data: &[u8]) -> Result<ObjectLocation> {
         let total_needed = align_to_page(
             OBJECT_HEADER_SIZE as u64 + data.len() as u64,
             self.page_size,
         );
         if total_needed > self.capacity {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "data exceeds maximum segment threshold",
-            ));
+            return Err(Error::StorageFull {
+                needed: total_needed - self.capacity,
+            });
         }
 
         if self.active.is_none() {
@@ -202,7 +194,7 @@ impl BlobStorage {
         let active = self
             .active
             .as_mut()
-            .ok_or_else(|| io::Error::other("active segment lost during initialization"))?;
+            .ok_or_else(|| Error::Internal("active segment lost at ingestion".to_string()))?;
 
         match active.ingest(object_id, data) {
             Ok(IngestedObject {
@@ -223,9 +215,7 @@ impl BlobStorage {
 
                 Ok(object_location)
             }
-            Err(e) if e.kind() == io::ErrorKind::StorageFull => {
-                self.rotate_and_put(object_id, data, FLAG_NONE)
-            }
+            Err(Error::StorageFull { .. }) => self.rotate_and_put(object_id, data, FLAG_NONE),
             Err(e) => Err(e),
         }
     }
@@ -235,11 +225,11 @@ impl BlobStorage {
         object_id: Uuid,
         data: &[u8],
         flags: u16,
-    ) -> io::Result<ObjectLocation> {
+    ) -> Result<ObjectLocation> {
         let old_active = self
             .active
             .take()
-            .ok_or_else(|| io::Error::other("active segment missing during cycle"))?;
+            .ok_or_else(|| Error::Internal("active segment lost at rotation".to_string()))?;
 
         let old_id = old_active.id();
         let sealed_path = self.layout.path_for(old_id).sealed().build();
@@ -288,7 +278,7 @@ impl BlobStorage {
 // MARK: - Get
 
 impl BlobStorage {
-    pub fn get(&self, segment_id: &Uuid, offset: u64) -> io::Result<Vec<u8>> {
+    pub fn get(&self, segment_id: &Uuid, offset: u64) -> Result<Vec<u8>> {
         if let Some(active) = self.active.as_ref()
             && active.id() == *segment_id
         {
@@ -308,15 +298,14 @@ impl BlobStorage {
             return self.process_header_result(header, data);
         }
 
-        Err(io::Error::new(io::ErrorKind::NotFound, "segment not found"))
+        Err(Error::Internal("segment not found".to_string()))
     }
 
-    fn process_header_result(&self, header: ObjectHeader, data: Vec<u8>) -> io::Result<Vec<u8>> {
+    fn process_header_result(&self, header: ObjectHeader, data: Vec<u8>) -> Result<Vec<u8>> {
         if (header.flags() & FLAG_TOMBSTONE) != 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "object was deleted",
-            ));
+            return Err(Error::ObjectDeleted {
+                id: header.object_id(),
+            });
         }
         Ok(data)
     }
@@ -325,7 +314,7 @@ impl BlobStorage {
 // MARK: - Delete
 
 impl BlobStorage {
-    pub fn delete(&mut self, object_id: Uuid) -> io::Result<ObjectLocation> {
+    pub fn delete(&mut self, object_id: Uuid) -> Result<ObjectLocation> {
         if self.active.is_none() {
             let id = Uuid::now_v7();
             let path = self.layout.path_for(id).active().build();
@@ -340,11 +329,11 @@ impl BlobStorage {
         let active = self
             .active
             .as_mut()
-            .ok_or_else(|| io::Error::other("active segment lost during deletion"))?;
+            .ok_or_else(|| Error::Internal("active segment lost at deletion".to_string()))?;
 
         let ingested = match active.delete(object_id) {
             Ok(ingested) => ingested,
-            Err(e) if e.kind() == io::ErrorKind::StorageFull => {
+            Err(Error::StorageFull { .. }) => {
                 return self.rotate_and_put(object_id, &[], FLAG_TOMBSTONE);
             }
             Err(e) => return Err(e),
@@ -435,7 +424,7 @@ impl StorageLayout {
         }
     }
 
-    pub fn initialize(&self) -> io::Result<()> {
+    pub fn initialize(&self) -> Result<()> {
         for dir in [ACTIVE_DIR, SEALED_DIR, COMPACTED_DIR] {
             fs::create_dir_all(self.base_dir.join(dir))?;
         }

@@ -3,30 +3,33 @@ use std::{fs::File, io, num::NonZeroUsize, path::Path, sync::Mutex};
 use lru::LruCache;
 use uuid::Uuid;
 
+use crate::blob::error::{Error, Result};
+
 struct FileCache {
     cache: Mutex<LruCache<Uuid, File>>,
 }
 
 impl FileCache {
-    pub fn new(capacity: usize) -> io::Result<Self> {
-        let cap =
-            NonZeroUsize::new(capacity).ok_or_else(|| io::Error::other("invalid capacity"))?;
+    pub fn new(capacity: usize) -> Result<Self> {
+        let cap = NonZeroUsize::new(capacity)
+            .ok_or_else(|| Error::InvalidConfiguration("invalid max open file".to_string()))?;
         Ok(Self {
             cache: Mutex::new(LruCache::new(cap)),
         })
     }
 
-    fn open<P>(&self, id: Uuid, path: P) -> io::Result<File>
+    fn open<P>(&self, id: Uuid, path: P) -> Result<File>
     where
         P: AsRef<Path>,
     {
         let mut cache = self
             .cache
             .lock()
-            .map_err(|e| io::Error::other(format!("cache poisoned: {e}")))?;
+            .map_err(|e| Error::CachePoisoned(e.to_string()))?;
 
         if let Some(file) = cache.get(&id) {
-            return file.try_clone();
+            let file_to_return = file.try_clone()?;
+            return Ok(file_to_return);
         }
 
         let file_to_cache = File::open(path)?;
@@ -44,14 +47,16 @@ pub struct FileCachePool {
 }
 
 impl FileCachePool {
-    pub fn new(num_shards: usize, capacity_per_shard: usize) -> io::Result<Self> {
+    pub fn new(num_shards: usize, capacity_per_shard: usize) -> Result<Self> {
         if num_shards == 0 || (num_shards & (num_shards - 1)) != 0 {
-            return Err(io::Error::other("num_shards must be a power of two"));
+            return Err(Error::InvalidConfiguration(
+                "num_shards must be a power of two".to_string(),
+            ));
         }
 
         let shards: Vec<FileCache> = (0..num_shards)
             .map(|_| FileCache::new(capacity_per_shard))
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>>>()?;
 
         Ok(Self {
             shards,
@@ -59,7 +64,7 @@ impl FileCachePool {
         })
     }
 
-    pub fn get<P>(&self, id: Uuid, path: P) -> io::Result<File>
+    pub fn get<P>(&self, id: Uuid, path: P) -> Result<File>
     where
         P: AsRef<Path>,
     {
