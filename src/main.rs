@@ -1,5 +1,6 @@
 mod blob;
 mod id;
+mod metadata;
 mod sys;
 mod vector;
 mod wal;
