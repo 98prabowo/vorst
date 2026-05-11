@@ -224,19 +224,30 @@ impl Segment<Active> {
             .collect()
     }
 
-    pub fn ingest(&mut self, id: Uuid, data: &[u8]) -> Result<IngestedObject> {
-        self.ingest_with_flags(id, data, FLAG_NONE)
+    pub fn ingest(
+        &mut self,
+        file_id: Uuid,
+        object_id: Uuid,
+        data: &[u8],
+    ) -> Result<IngestedObject> {
+        self.ingest_with_flags(file_id, object_id, data, FLAG_NONE)
     }
 
-    pub fn delete(&mut self, id: Uuid) -> Result<IngestedObject> {
-        self.ingest_with_flags(id, &[], FLAG_TOMBSTONE)
+    pub fn delete(&mut self, file_id: Uuid) -> Result<IngestedObject> {
+        self.ingest_with_flags(file_id, Uuid::nil(), &[], FLAG_TOMBSTONE)
     }
 
-    pub fn corrupted(&mut self, id: Uuid) -> Result<IngestedObject> {
-        self.ingest_with_flags(id, &[], FLAG_CORRUPTED)
+    pub fn corrupted(&mut self, file_id: Uuid, object_id: Uuid) -> Result<IngestedObject> {
+        self.ingest_with_flags(file_id, object_id, &[], FLAG_CORRUPTED)
     }
 
-    fn ingest_with_flags(&mut self, id: Uuid, data: &[u8], flags: u16) -> Result<IngestedObject> {
+    fn ingest_with_flags(
+        &mut self,
+        file_id: Uuid,
+        object_id: Uuid,
+        data: &[u8],
+        flags: u16,
+    ) -> Result<IngestedObject> {
         // FIXME: Implement a write-ahead log (WAL) or a "commit" bit for individual
         // objects. Currently, if the process crashes mid-write, a partial object might exist
         // that passes the magic number check but contains garbage data.
@@ -253,7 +264,7 @@ impl Segment<Active> {
 
         let data_len = data.len() as u32;
         let checksum = BlobHasher::hash(data);
-        let object_header = ObjectHeader::new(id, data_len, flags, checksum);
+        let object_header = ObjectHeader::new(file_id, object_id, data_len, flags, checksum);
 
         // FIXME: Use `pwritev` (Vectored I/O). Instead of creating a temporary `Vec`
         // and padding it with zeros, use `io::IoSlice` to write the header, data, and

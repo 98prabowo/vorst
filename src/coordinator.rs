@@ -69,7 +69,7 @@ impl StorageCoordinator {
             let chunk_data = &data[..current_chunk_len];
 
             let object_id = Uuid::now_v7();
-            let location = self.blob.put(object_id, chunk_data)?;
+            let location = self.blob.put(file_id, object_id, chunk_data)?;
 
             data = &data[current_chunk_len..];
             chunks.push(location);
@@ -104,12 +104,8 @@ impl StorageCoordinator {
     }
 
     pub fn delete_file(&mut self, file_id: Uuid) -> Result<()> {
-        let object_ids = self.metadata.delete_file(file_id)?;
-
-        for object_id in object_ids {
-            self.blob.delete(object_id)?;
-        }
-
+        let _object_ids = self.metadata.delete_file(file_id)?;
+        self.blob.delete(file_id)?;
         Ok(())
     }
 }

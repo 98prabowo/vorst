@@ -1,7 +1,7 @@
 use std::{
     any::TypeId,
     collections::HashMap,
-    fs, io,
+    fs,
     path::{Path, PathBuf},
 };
 
@@ -169,7 +169,7 @@ impl BlobStorage {
 // MARK: - Put
 
 impl BlobStorage {
-    pub fn put(&mut self, object_id: Uuid, data: &[u8]) -> Result<ObjectLocation> {
+    pub fn put(&mut self, file_id: Uuid, object_id: Uuid, data: &[u8]) -> Result<ObjectLocation> {
         let total_needed = align_to_page(
             OBJECT_HEADER_SIZE as u64 + data.len() as u64,
             self.page_size,
@@ -196,7 +196,7 @@ impl BlobStorage {
             .as_mut()
             .ok_or_else(|| Error::Internal("active segment lost at ingestion".to_string()))?;
 
-        match active.ingest(object_id, data) {
+        match active.ingest(file_id, object_id, data) {
             Ok(IngestedObject {
                 offset,
                 length,
@@ -215,13 +215,16 @@ impl BlobStorage {
 
                 Ok(object_location)
             }
-            Err(Error::StorageFull { .. }) => self.rotate_and_put(object_id, data, FLAG_NONE),
+            Err(Error::StorageFull { .. }) => {
+                self.rotate_and_put(file_id, object_id, data, FLAG_NONE)
+            }
             Err(e) => Err(e),
         }
     }
 
     fn rotate_and_put(
         &mut self,
+        file_id: Uuid,
         object_id: Uuid,
         data: &[u8],
         flags: u16,
@@ -256,7 +259,7 @@ impl BlobStorage {
             offset,
             length,
             checksum,
-        } = next_active.ingest(object_id, data)?;
+        } = next_active.ingest(file_id, object_id, data)?;
 
         let object_location = ObjectLocation {
             segment_id: new_id,
@@ -314,7 +317,7 @@ impl BlobStorage {
 // MARK: - Delete
 
 impl BlobStorage {
-    pub fn delete(&mut self, object_id: Uuid) -> Result<ObjectLocation> {
+    pub fn delete(&mut self, file_id: Uuid) -> Result<ObjectLocation> {
         if self.active.is_none() {
             let id = Uuid::now_v7();
             let path = self.layout.path_for(id).active().build();
@@ -331,10 +334,10 @@ impl BlobStorage {
             .as_mut()
             .ok_or_else(|| Error::Internal("active segment lost at deletion".to_string()))?;
 
-        let ingested = match active.delete(object_id) {
+        let ingested = match active.delete(file_id) {
             Ok(ingested) => ingested,
             Err(Error::StorageFull { .. }) => {
-                return self.rotate_and_put(object_id, &[], FLAG_TOMBSTONE);
+                return self.rotate_and_put(file_id, Uuid::nil(), &[], FLAG_TOMBSTONE);
             }
             Err(e) => return Err(e),
         };
@@ -342,7 +345,7 @@ impl BlobStorage {
         Ok(ObjectLocation {
             segment_id: active.id(),
             object_offset: ObjectOffset {
-                object_id,
+                object_id: Uuid::nil(),
                 offset: ingested.offset,
                 flags: FLAG_TOMBSTONE,
             },

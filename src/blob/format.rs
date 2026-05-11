@@ -124,18 +124,20 @@ pub struct ObjectHeader {
     flags: u16,
     data_len: u32,
     checksum: u32,
+    file_id: [u8; 16],
     object_id: [u8; 16],
 }
 
 impl ObjectHeader {
-    pub fn new(id: Uuid, len: u32, flags: u16, checksum: u32) -> Self {
+    pub fn new(file_id: Uuid, object_id: Uuid, len: u32, flags: u16, checksum: u32) -> Self {
         Self {
             magic: OBJECT_MAGIC.to_le(),
             version: 1u16.to_le(),
             flags: flags.to_le(),
             data_len: len.to_le(),
             checksum: checksum.to_le(),
-            object_id: id.into_bytes(),
+            file_id: file_id.into_bytes(),
+            object_id: object_id.into_bytes(),
         }
     }
 
@@ -145,6 +147,10 @@ impl ObjectHeader {
 
     pub fn flags(&self) -> u16 {
         u16::from_le(self.flags)
+    }
+
+    pub fn file_id(&self) -> Uuid {
+        Uuid::from_bytes(self.file_id)
     }
 
     pub fn object_id(&self) -> Uuid {
