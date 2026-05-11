@@ -1,15 +1,16 @@
 use std::fs::File;
 
-use crate::blob::types::CompactionMap;
+use crate::blob::{OBJECT_SIZE, types::CompactionMap, utils::AlignedBuffer};
 
 pub trait SegmentState {}
 pub trait ImmutableSegment: SegmentState + Default {}
 
 pub struct Active {
-    pub capacity: u64,
+    pub segment_size: u64,
     pub entries_count: u32,
     pub write_cursor: u64,
     pub file: File,
+    pub io_buffer: Box<AlignedBuffer<{ OBJECT_SIZE as usize }>>,
 }
 
 #[derive(Default)]

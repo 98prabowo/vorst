@@ -9,15 +9,16 @@ use fs2::FileExt as Fs2FileExt;
 use uuid::Uuid;
 
 use crate::{
+    PAGE_SIZE,
     blob::{
         error::{Error, Result},
         format::{
             FLAG_CORRUPTED, FLAG_NONE, FLAG_TOMBSTONE, OBJECT_HEADER_SIZE, ObjectHeader,
-            SegmentHeader,
+            SEGMENT_HEADER_SIZE, SegmentHeader,
         },
         state::{Active, ImmutableSegment, Sealed, SegmentState},
         types::{IngestedObject, ObjectOffset},
-        utils::{BlobHasher, align_to_page},
+        utils::{AlignedBuffer, BlobHasher, align_to_page},
     },
     sys::preallocate,
 };
@@ -31,7 +32,6 @@ use crate::{
 pub struct Segment<S: SegmentState> {
     pub id: Uuid,
     pub path: PathBuf,
-    pub page_size: u64,
     pub created_at: DateTime<Utc>,
     pub state: S,
 }
@@ -93,7 +93,7 @@ impl<S: SegmentState> Segment<S> {
 }
 
 impl<S: ImmutableSegment> Segment<S> {
-    pub fn open_readonly<P>(id: Uuid, path: P, page_size: u64) -> Result<Self>
+    pub fn open_readonly<P>(id: Uuid, path: P) -> Result<Self>
     where
         P: AsRef<Path>,
     {
@@ -108,7 +108,6 @@ impl<S: ImmutableSegment> Segment<S> {
         Ok(Self {
             id,
             path: path_buf,
-            page_size,
             created_at,
             state: S::default(),
         })
@@ -116,11 +115,11 @@ impl<S: ImmutableSegment> Segment<S> {
 }
 
 impl Segment<Active> {
-    pub fn new<P>(id: Uuid, path: P, data_capacity: u64, page_size: u64) -> Result<Self>
+    pub fn new<P>(id: Uuid, path: P, data_size: u64) -> Result<Self>
     where
         P: AsRef<Path>,
     {
-        let capacity = page_size + data_capacity;
+        let segment_size = PAGE_SIZE + data_size;
         let now = Utc::now();
         let path_buf = path.as_ref().to_path_buf();
 
@@ -137,10 +136,13 @@ impl Segment<Active> {
                 path: path.as_ref().to_path_buf(),
             })?;
 
-        let segment_header = SegmentHeader::new(id, 0, capacity, now);
-        file.write_all_at(bytemuck::bytes_of(&segment_header), 0)?;
+        let segment_header = SegmentHeader::new(id, 0, segment_size, now);
+        let mut buf = AlignedBuffer::<{ PAGE_SIZE as usize }>::new_boxed();
+        buf.fill(0);
+        buf[..SEGMENT_HEADER_SIZE].copy_from_slice(bytemuck::bytes_of(&segment_header));
+        file.write_all_at(&buf[..], 0)?;
 
-        preallocate(&file, capacity)?;
+        preallocate(&file, segment_size)?;
         file.sync_all()?;
 
         if let Some(parent) = path_buf.parent() {
@@ -151,18 +153,18 @@ impl Segment<Active> {
         Ok(Self {
             id,
             path: path_buf,
-            page_size,
             created_at: now,
             state: Active {
-                capacity,
+                segment_size,
                 entries_count: 0,
-                write_cursor: page_size,
+                write_cursor: PAGE_SIZE,
                 file,
+                io_buffer: AlignedBuffer::new_boxed(),
             },
         })
     }
 
-    pub fn open<P>(id: Uuid, path: P, page_size: u64) -> Result<Self>
+    pub fn open<P>(id: Uuid, path: P) -> Result<Self>
     where
         P: AsRef<Path>,
     {
@@ -176,19 +178,28 @@ impl Segment<Active> {
             })?;
 
         let segment_header = SegmentHeader::header(&file, id)?;
-        let capacity = segment_header.capacity();
+        let segment_size = segment_header.segment_size();
         let created_at = segment_header.created_at()?;
+
+        let actual_file_len = file.metadata()?.len();
+        if actual_file_len < segment_size {
+            return Err(Error::UnexpectedEof {
+                id,
+                expected: segment_size,
+                found: actual_file_len,
+            });
+        }
 
         let mut segment = Self {
             id,
             path: path_buf,
-            page_size,
             created_at,
             state: Active {
-                capacity,
+                segment_size,
                 entries_count: 0,
-                write_cursor: page_size,
+                write_cursor: PAGE_SIZE,
                 file,
+                io_buffer: AlignedBuffer::new_boxed(),
             },
         };
 
@@ -198,13 +209,12 @@ impl Segment<Active> {
             match segment.read_object_at(&segment.state.file, last_object.offset) {
                 Ok((header, _data)) => {
                     let next_pos = last_object.offset + header.object_size();
-                    segment.state.write_cursor = align_to_page(next_pos, page_size);
+                    segment.state.write_cursor = align_to_page(next_pos);
                     segment.state.entries_count = object_offsets.len() as u32;
                 }
                 Err(e) if e.is_recoverable() => {
                     segment.state.write_cursor = last_object.offset;
                     segment.state.entries_count = (object_offsets.len() - 1) as u32;
-                    segment.state.file.set_len(last_object.offset)?;
 
                     eprintln!(
                         "recovered from partial write at offset {}",
@@ -254,11 +264,24 @@ impl Segment<Active> {
 
         let offset = self.state.write_cursor;
         let total_len = OBJECT_HEADER_SIZE as u64 + data.len() as u64;
-        let padded_len = align_to_page(total_len, self.page_size) as usize;
+        let padded_len = align_to_page(total_len) as usize;
 
-        if offset + padded_len as u64 > self.state.capacity {
+        assert!(
+            padded_len as u64 >= total_len,
+            "Alignment logic failure: padded_len is smaller than total_len"
+        );
+        assert!(
+            padded_len <= self.state.io_buffer.len(),
+            "Invariant Violation: Object exceeds IO buffer capacity"
+        );
+        assert!(
+            offset.is_multiple_of(PAGE_SIZE),
+            "Invariant Violation: Write cursor is unaligned"
+        );
+
+        if offset + padded_len as u64 > self.state.segment_size {
             return Err(Error::StorageFull {
-                needed: (offset + padded_len as u64) - self.state.capacity,
+                needed: (offset + padded_len as u64) - self.state.segment_size,
             });
         }
 
@@ -271,12 +294,12 @@ impl Segment<Active> {
         // padding in a single atomic syscall. This avoids zero-filling memory and
         // extra copies.
 
-        let mut entry = Vec::with_capacity(padded_len);
-        entry.extend_from_slice(bytemuck::bytes_of(&object_header));
-        entry.extend_from_slice(data);
-        entry.resize(padded_len, 0);
+        let buf = &mut self.state.io_buffer;
+        buf[total_len as usize..padded_len].fill(0);
+        buf[..OBJECT_HEADER_SIZE].copy_from_slice(bytemuck::bytes_of(&object_header));
+        buf[OBJECT_HEADER_SIZE..total_len as usize].copy_from_slice(data);
 
-        self.state.file.write_all_at(&entry, offset)?;
+        self.state.file.write_all_at(&buf[..padded_len], offset)?;
         self.state.write_cursor += padded_len as u64;
         self.state.entries_count += 1;
 
@@ -309,7 +332,6 @@ impl Segment<Active> {
         Ok(Segment {
             id: self.id,
             path: self.path,
-            page_size: self.page_size,
             created_at: self.created_at,
             state: Sealed,
         })
@@ -330,7 +352,7 @@ impl<'segment, S: SegmentState> ObjectIterator<'segment, S> {
         Self {
             segment,
             file,
-            cursor: segment.page_size,
+            cursor: PAGE_SIZE,
             capacity,
         }
     }
@@ -349,7 +371,7 @@ impl<'a, S: SegmentState> Iterator for ObjectIterator<'a, S> {
                 let offset = self.cursor;
                 let object_size = header.object_size();
 
-                self.cursor += align_to_page(object_size, self.segment.page_size);
+                self.cursor += align_to_page(object_size);
                 Some(Ok((offset, header)))
             }
             Err(Error::InvalidMagic { .. }) => None,

@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
 use crate::{
-    blob::{BlobStorage, CompactionPolicy},
+    blob::{BlobStorage, CompactionPolicy, DATA_SIZE, OBJECT_SIZE, SEGMENT_SIZE},
     error::Result,
     metadata::MetadataStorage,
 };
@@ -10,7 +10,7 @@ pub struct StorageConfig {
     chunk_size: u64,
     metadata_path: String,
     blob_base_dir: String,
-    blob_capacity: u64,
+    blob_segment_size: u64,
     file_pool_count: u32,
     file_pool_capacity: u32,
 }
@@ -25,10 +25,10 @@ impl Default for StorageConfig {
         let file_pool_capacity = max_fd_open / file_pool_count;
 
         Self {
-            chunk_size: 4 * 1024 * 1024,
+            chunk_size: OBJECT_SIZE,
             metadata_path: "./data/metadata/vorst.redb".to_string(),
             blob_base_dir: "./data/blob".to_string(),
-            blob_capacity: 64 * 1024 * 1024,
+            blob_segment_size: SEGMENT_SIZE,
             file_pool_count,
             file_pool_capacity,
         }
@@ -38,17 +38,16 @@ impl Default for StorageConfig {
 pub struct StorageCoordinator {
     metadata: MetadataStorage,
     blob: BlobStorage,
-    chunk_size: u64,
+    data_size_max: u64,
 }
 
 impl StorageCoordinator {
-    pub fn open(config: StorageConfig, page_size: u64) -> Result<Self> {
+    pub fn open(config: StorageConfig) -> Result<Self> {
         let metadata = MetadataStorage::open(&config.metadata_path)?;
 
         let blob = BlobStorage::open(
             &config.blob_base_dir,
-            config.blob_capacity,
-            page_size,
+            config.blob_segment_size,
             config.file_pool_count,
             config.file_pool_capacity,
             CompactionPolicy::default(),
@@ -57,7 +56,7 @@ impl StorageCoordinator {
         Ok(Self {
             metadata,
             blob,
-            chunk_size: config.chunk_size,
+            data_size_max: DATA_SIZE,
         })
     }
 
@@ -65,13 +64,13 @@ impl StorageCoordinator {
         let mut chunks = Vec::new();
 
         while !data.is_empty() {
-            let current_chunk_len = std::cmp::min(data.len() as u64, self.chunk_size) as usize;
-            let chunk_data = &data[..current_chunk_len];
+            let chunk_len = std::cmp::min(data.len() as u64, self.data_size_max) as usize;
+            let chunk_data = &data[..chunk_len];
 
             let object_id = Uuid::now_v7();
             let location = self.blob.put(file_id, object_id, chunk_data)?;
 
-            data = &data[current_chunk_len..];
+            data = &data[chunk_len..];
             chunks.push(location);
         }
 

@@ -4,9 +4,12 @@ use bytemuck::{Pod, Zeroable};
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::blob::{
-    error::{Error, Result},
-    utils::AlignedBuffer,
+use crate::{
+    PAGE_SIZE,
+    blob::{
+        error::{Error, Result},
+        utils::AlignedBuffer,
+    },
 };
 
 // "VBSF" (Vorst Blob Segment Format)
@@ -18,6 +21,10 @@ pub const OBJECT_MAGIC: u32 = 0x5642534F;
 pub const SEGMENT_HEADER_SIZE: usize = size_of::<SegmentHeader>();
 pub const OBJECT_HEADER_SIZE: usize = size_of::<ObjectHeader>();
 
+pub const SEGMENT_SIZE: u64 = 64 * 1024 * 1024;
+pub const OBJECT_SIZE: u64 = 4 * 1024 * 1024;
+pub const DATA_SIZE: u64 = OBJECT_SIZE - PAGE_SIZE;
+
 pub const FLAG_NONE: u16 = 0x0000;
 pub const FLAG_TOMBSTONE: u16 = 0x0001;
 pub const FLAG_CORRUPTED: u16 = 0x0002;
@@ -27,7 +34,7 @@ pub const FLAG_CORRUPTED: u16 = 0x0002;
 pub struct SegmentHeader {
     magic: u32,
     version: u32,
-    capacity: u64,
+    segment_size: u64,
     created_at: i64,
     sealed_at: i64,
     entries_count: u32,
@@ -36,11 +43,11 @@ pub struct SegmentHeader {
 }
 
 impl SegmentHeader {
-    pub fn new(id: Uuid, count: u32, capacity: u64, created_at: DateTime<Utc>) -> Self {
+    pub fn new(id: Uuid, count: u32, segment_size: u64, created_at: DateTime<Utc>) -> Self {
         Self {
             magic: SEGMENT_MAGIC.to_le(),
             version: 1u32.to_le(),
-            capacity: capacity.to_le(),
+            segment_size: segment_size.to_le(),
             created_at: created_at.timestamp().to_le(),
             sealed_at: 0,
             entries_count: count.to_le(),
@@ -53,8 +60,12 @@ impl SegmentHeader {
         u32::from_le(self.magic)
     }
 
-    pub fn capacity(&self) -> u64 {
-        u64::from_le(self.capacity)
+    pub fn version(&self) -> u32 {
+        u32::from_le(self.version)
+    }
+
+    pub fn segment_size(&self) -> u64 {
+        u64::from_le(self.segment_size)
     }
 
     pub fn created_at(&self) -> Result<DateTime<Utc>> {
@@ -82,6 +93,10 @@ impl SegmentHeader {
             });
         }
 
+        if self.version() > 1 {
+            return Err(Error::Internal("unsupported segment version".to_string()));
+        }
+
         if self.segment_id() != id {
             return Err(Error::IdMismatch {
                 expected: id,
@@ -96,10 +111,10 @@ impl SegmentHeader {
         let mut buf = AlignedBuffer::<{ size_of::<Self>() }>::default();
         file.read_exact_at(&mut *buf, 0)?;
 
-        let header: Self = *bytemuck::from_bytes(&*buf);
+        let header: &Self = bytemuck::from_bytes(&*buf);
         header.validate(segment_id)?;
 
-        Ok(header)
+        Ok(*header)
     }
 
     pub fn write_sealed_at(file: &File, dt: DateTime<Utc>) -> Result<()> {
@@ -145,6 +160,10 @@ impl ObjectHeader {
         u32::from_le(self.magic)
     }
 
+    pub fn version(&self) -> u16 {
+        u16::from_le(self.version)
+    }
+
     pub fn flags(&self) -> u16 {
         u16::from_le(self.flags)
     }
@@ -170,16 +189,24 @@ impl ObjectHeader {
     }
 
     pub fn header(file: &File, segment_id: Uuid, offset: u64, file_capacity: u64) -> Result<Self> {
+        if !offset.is_multiple_of(PAGE_SIZE) {
+            return Err(Error::Internal(format!("unaligned offset: {offset}")));
+        }
+
         let mut buf = AlignedBuffer::<{ size_of::<Self>() }>::default();
         file.read_exact_at(&mut *buf, offset)?;
 
-        let header: Self = *bytemuck::from_bytes(&*buf);
+        let header: &Self = bytemuck::from_bytes(&*buf);
 
         if header.magic() != OBJECT_MAGIC {
             return Err(Error::InvalidMagic {
                 expected: OBJECT_MAGIC,
                 found: header.magic(),
             });
+        }
+
+        if header.version() > 1 {
+            return Err(Error::Internal("unsupported object version".to_string()));
         }
 
         if offset + header.object_size() > file_capacity {
@@ -190,6 +217,10 @@ impl ObjectHeader {
             });
         }
 
-        Ok(header)
+        Ok(*header)
     }
 }
+
+const _: () = assert!(std::mem::size_of::<SegmentHeader>() == SEGMENT_HEADER_SIZE);
+const _: () = assert!(std::mem::size_of::<ObjectHeader>() == OBJECT_HEADER_SIZE);
+const _: () = assert!(std::mem::align_of::<SegmentHeader>() <= PAGE_SIZE as usize);

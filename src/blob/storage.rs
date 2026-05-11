@@ -35,7 +35,6 @@ pub struct BlobStorage {
     compacted: HashMap<Uuid, Segment<Compacted>>,
     file_cache: FileCachePool,
     capacity: u64,
-    page_size: u64,
     compaction_policy: CompactionPolicy,
 }
 
@@ -45,7 +44,6 @@ impl BlobStorage {
     pub fn open<P>(
         base_dir: P,
         capacity: u64,
-        page_size: u64,
         file_pool_count: u32,
         file_pool_capacity: u32,
         compaction_policy: CompactionPolicy,
@@ -58,8 +56,8 @@ impl BlobStorage {
 
         let file_cache = FileCachePool::new(file_pool_count as usize, file_pool_capacity as usize)?;
 
-        let compacted = Self::hydrate_descriptors::<Compacted>(&layout, page_size)?;
-        let mut sealed = Self::hydrate_descriptors::<Sealed>(&layout, page_size)?;
+        let compacted = Self::hydrate_descriptors::<Compacted>(&layout)?;
+        let mut sealed = Self::hydrate_descriptors::<Sealed>(&layout)?;
 
         let mut active_paths = Self::scan_segments(layout.active_dir(), "tmp")?;
         active_paths.sort_by_key(|p| Self::path_id(p).unwrap_or_default());
@@ -68,12 +66,12 @@ impl BlobStorage {
 
         if let Some(last_path) = active_paths.pop() {
             let id = Self::path_id(&last_path)?;
-            let segment = Segment::<Active>::open(id, last_path, page_size)?;
+            let segment = Segment::<Active>::open(id, last_path)?;
             active = Some(segment);
 
             for zombie_path in active_paths {
                 let id = Self::path_id(&zombie_path)?;
-                let zombie = Segment::<Active>::open(id, zombie_path, page_size)?;
+                let zombie = Segment::<Active>::open(id, zombie_path)?;
                 let mut sealed_segment = zombie.seal()?;
 
                 let sealed_path = layout.path_for(id).sealed().build();
@@ -93,14 +91,12 @@ impl BlobStorage {
             compacted,
             file_cache,
             capacity,
-            page_size,
             compaction_policy,
         })
     }
 
     fn hydrate_descriptors<S: ImmutableSegment + 'static>(
         layout: &StorageLayout,
-        page_size: u64,
     ) -> Result<HashMap<Uuid, Segment<S>>> {
         let dir = if TypeId::of::<S>() == TypeId::of::<Compacted>() {
             layout.compacted_dir()
@@ -113,7 +109,7 @@ impl BlobStorage {
 
         for path in paths {
             let id = Self::path_id(&path)?;
-            let segment = Segment::<S>::open_readonly(id, path, page_size)?;
+            let segment = Segment::<S>::open_readonly(id, path)?;
             map.insert(id, segment);
         }
 
@@ -170,10 +166,7 @@ impl BlobStorage {
 
 impl BlobStorage {
     pub fn put(&mut self, file_id: Uuid, object_id: Uuid, data: &[u8]) -> Result<ObjectLocation> {
-        let total_needed = align_to_page(
-            OBJECT_HEADER_SIZE as u64 + data.len() as u64,
-            self.page_size,
-        );
+        let total_needed = align_to_page(OBJECT_HEADER_SIZE as u64 + data.len() as u64);
         if total_needed > self.capacity {
             return Err(Error::StorageFull {
                 needed: total_needed - self.capacity,
@@ -183,12 +176,7 @@ impl BlobStorage {
         if self.active.is_none() {
             let id = Uuid::now_v7();
             let path = self.layout.path_for(id).active().build();
-            self.active = Some(Segment::<Active>::new(
-                id,
-                path,
-                self.capacity,
-                self.page_size,
-            )?);
+            self.active = Some(Segment::<Active>::new(id, path, self.capacity)?);
         }
 
         let active = self
@@ -252,8 +240,7 @@ impl BlobStorage {
         let new_id = Uuid::now_v7();
         let new_path = self.layout.path_for(new_id).active().build();
 
-        let mut next_active =
-            Segment::<Active>::new(new_id, new_path, self.capacity, self.page_size)?;
+        let mut next_active = Segment::<Active>::new(new_id, new_path, self.capacity)?;
 
         let IngestedObject {
             offset,
@@ -321,12 +308,7 @@ impl BlobStorage {
         if self.active.is_none() {
             let id = Uuid::now_v7();
             let path = self.layout.path_for(id).active().build();
-            self.active = Some(Segment::<Active>::new(
-                id,
-                path,
-                self.capacity,
-                self.page_size,
-            )?);
+            self.active = Some(Segment::<Active>::new(id, path, self.capacity)?);
         }
 
         let active = self

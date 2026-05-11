@@ -25,6 +25,11 @@ pub enum Error {
     ObjectDeleted { id: Uuid },
 
     // --- Data Integrity Errors ---
+    #[error(
+        "Unexpected EOF in segment {id}: header expects {expected} bytes, but file is {found} bytes"
+    )]
+    UnexpectedEof { id: Uuid, expected: u64, found: u64 },
+
     #[error("Out of bounds in segment {id}: offset {offset} + size {size} exceeds capacity")]
     OutOfBounds { id: Uuid, offset: u64, size: u64 },
 
@@ -59,10 +64,10 @@ impl Error {
     pub fn is_recoverable(&self) -> bool {
         matches!(
             self,
-            Self::OutOfBounds { .. }
+            Self::TornWrite { .. }
+                | Self::UnexpectedEof { .. }
                 | Self::InvalidMagic { .. }
                 | Self::ChecksumMismatch { .. }
-                | Self::TornWrite { .. }
         )
     }
 }

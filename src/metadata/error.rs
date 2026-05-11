@@ -28,6 +28,7 @@ pub enum Error {
     #[error("Object {0} not found in metadata")]
     ObjectNotFound(Uuid),
 
+    // --- Internal Errors ---
     #[error("Internal metadata error: {0}")]
     Internal(String),
 }

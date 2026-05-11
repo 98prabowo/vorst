@@ -5,8 +5,7 @@ use std::{fs::File, io};
 pub fn preallocate(file: &File, size: u64) -> io::Result<()> {
     use nix::fcntl::{FallocateFlags, fallocate};
 
-    fallocate(file.as_raw_fd(), FallocateFlags::empty(), 0, size as i64)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+    fallocate(file.as_raw_fd(), FallocateFlags::empty(), 0, size as i64).map_err(io::Error::from)
 }
 
 #[cfg(target_os = "macos")]

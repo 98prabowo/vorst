@@ -1,8 +1,11 @@
 use std::ops::{Deref, DerefMut};
 
+use crate::PAGE_SIZE;
+
 pub struct BlobHasher;
 
 impl BlobHasher {
+    #[inline(always)]
     pub fn hash(data: &[u8]) -> u32 {
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(data);
@@ -10,8 +13,16 @@ impl BlobHasher {
     }
 }
 
-#[repr(align(8))]
+#[repr(align(65536))]
 pub struct AlignedBuffer<const N: usize>(pub [u8; N]);
+
+impl<const N: usize> AlignedBuffer<N> {
+    pub fn new_boxed() -> Box<Self> {
+        let boxed_slice = vec![0u8; N].into_boxed_slice();
+        let ptr = Box::into_raw(boxed_slice) as *mut AlignedBuffer<N>;
+        unsafe { Box::from_raw(ptr) }
+    }
+}
 
 impl<const N: usize> Default for AlignedBuffer<N> {
     fn default() -> Self {
@@ -34,13 +45,8 @@ impl<const N: usize> DerefMut for AlignedBuffer<N> {
 }
 
 #[inline(always)]
-pub const fn align_to_page(size: u64, page_size: u64) -> u64 {
-    // NOTE: Current page alignment is hardcoded to the provided `page_size`. In
-    // production, we should query `libc::sysconf(_SC_PAGESIZE)` or use `O_DIRECT`
-    // requirements (usually 512 or 4096 bytes) to ensure we are actually hitting
-    // the disk's physical sector boundaries for maximum throughput.
-
-    debug_assert!(page_size.is_power_of_two());
-    let page_mask = page_size - 1;
+pub const fn align_to_page(size: u64) -> u64 {
+    const { assert!(PAGE_SIZE.is_power_of_two()) };
+    let page_mask = PAGE_SIZE - 1;
     (size + page_mask) & !page_mask
 }
