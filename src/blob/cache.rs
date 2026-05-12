@@ -50,7 +50,7 @@ impl FileCachePool {
     pub fn new(num_shards: usize, capacity_per_shard: usize) -> Result<Self> {
         if num_shards == 0 || (num_shards & (num_shards - 1)) != 0 {
             return Err(Error::InvalidConfiguration(
-                "num_shards must be a power of two".to_string(),
+                "file cache pool shards count must be a power of two".to_string(),
             ));
         }
 

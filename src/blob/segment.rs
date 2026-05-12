@@ -16,8 +16,8 @@ use crate::{
             FLAG_CORRUPTED, FLAG_NONE, FLAG_TOMBSTONE, OBJECT_HEADER_SIZE, ObjectHeader,
             SEGMENT_HEADER_SIZE, SegmentHeader,
         },
-        state::{Active, ImmutableSegment, Sealed, SegmentState},
-        types::{IngestedObject, ObjectOffset},
+        state::{Active, Compacted, ImmutableSegment, Sealed, SegmentState},
+        types::{IngestedObject, ObjectOffset, SegmentStats},
         utils::{AlignedBuffer, BlobHasher, align_to_page},
     },
     sys::preallocate,
@@ -37,21 +37,15 @@ pub struct Segment<S: SegmentState> {
 }
 
 impl<S: SegmentState> Segment<S> {
-    pub fn id(&self) -> Uuid {
-        self.id
-    }
-
     pub fn objects<'a>(&'a self, file: &'a File) -> Result<ObjectIterator<'a, S>> {
         let capacity = file.metadata()?.len();
         Ok(ObjectIterator::new(self, file, capacity))
     }
 
     pub fn scan_offsets(&self, file: &File) -> Result<Vec<ObjectOffset>> {
-        let len = file.metadata()?.len();
         let mut offsets = Vec::new();
-        let objects = ObjectIterator::new(self, file, len);
 
-        for object in objects {
+        for object in self.objects(file)? {
             match object {
                 Ok(data) => offsets.push(map_offset(Ok(data))?),
                 Err(e) if e.is_recoverable() => return Ok(offsets),
@@ -69,7 +63,7 @@ impl<S: SegmentState> Segment<S> {
             return Err(Error::TornWrite { offset });
         }
 
-        let object_header = ObjectHeader::header(file, self.id(), offset, file_len)?;
+        let object_header = ObjectHeader::header(file, self.id, offset, file_len)?;
 
         let mut data = vec![0u8; object_header.data_len() as usize];
         file.read_exact_at(&mut data, offset + OBJECT_HEADER_SIZE as u64)?;
@@ -89,6 +83,36 @@ impl<S: SegmentState> Segment<S> {
         // copying entirely, or `mmap` for frequently accessed "hot" segments.
 
         Ok((object_header, data))
+    }
+
+    pub fn check_health<F>(&self, file: &File, is_alive: &mut F) -> Result<SegmentStats>
+    where
+        F: FnMut(Uuid, Uuid, u64) -> bool,
+    {
+        let mut live_bytes = 0u64;
+        let mut live_count = 0u32;
+
+        for object in self.objects(file)? {
+            let (offset, header) = object?;
+
+            if header.flags() & FLAG_TOMBSTONE != 0 {
+                continue;
+            }
+
+            if is_alive(self.id, header.object_id(), offset) {
+                live_bytes += header.data_len() as u64;
+                live_count += 1;
+            }
+        }
+
+        Ok(SegmentStats {
+            id: self.id,
+            total_bytes: self.state.total_bytes(),
+            live_bytes,
+            entry_count: live_count,
+            status: self.state.status(),
+            created_at: self.created_at,
+        })
     }
 }
 
@@ -333,8 +357,24 @@ impl Segment<Active> {
             id: self.id,
             path: self.path,
             created_at: self.created_at,
-            state: Sealed,
+            state: Sealed {
+                total_bytes: final_size,
+                entry_count: self.state.entries_count,
+            },
         })
+    }
+}
+
+impl Segment<Sealed> {
+    pub fn compacted(self) -> Segment<Compacted> {
+        Segment {
+            id: self.id,
+            path: self.path,
+            created_at: self.created_at,
+            state: Compacted {
+                total_bytes: self.state.total_bytes,
+            },
+        }
     }
 }
 
@@ -366,7 +406,7 @@ impl<'a, S: SegmentState> Iterator for ObjectIterator<'a, S> {
             return None;
         }
 
-        match ObjectHeader::header(self.file, self.segment.id(), self.cursor, self.capacity) {
+        match ObjectHeader::header(self.file, self.segment.id, self.cursor, self.capacity) {
             Ok(header) => {
                 let offset = self.cursor;
                 let object_size = header.object_size();

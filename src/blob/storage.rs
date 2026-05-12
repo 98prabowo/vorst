@@ -8,16 +8,13 @@ use std::{
 use uuid::Uuid;
 
 use crate::blob::{
-    // compaction::BlobCompactable,
     cache::FileCachePool,
+    compaction::{CompactedObject, CompactedSegment, CompactionPlan},
     error::{Error, Result},
     format::{FLAG_NONE, FLAG_TOMBSTONE, OBJECT_HEADER_SIZE, ObjectHeader},
     segment::Segment,
-    state::{Active, Compacted, ImmutableSegment, Sealed},
-    types::{
-        CompactedSegment, CompactionPlan, CompactionPolicy, IngestedObject, ObjectLocation,
-        ObjectOffset,
-    },
+    state::{Active, Compacted, ImmutableSegment, Sealed, SegmentState},
+    types::{IngestedObject, ObjectLocation, ObjectOffset, SegmentStats},
     utils::align_to_page,
 };
 
@@ -34,8 +31,7 @@ pub struct BlobStorage {
     sealed: HashMap<Uuid, Segment<Sealed>>,
     compacted: HashMap<Uuid, Segment<Compacted>>,
     file_cache: FileCachePool,
-    capacity: u64,
-    compaction_policy: CompactionPolicy,
+    segment_size: u64,
 }
 
 // MARK: - Open
@@ -43,10 +39,9 @@ pub struct BlobStorage {
 impl BlobStorage {
     pub fn open<P>(
         base_dir: P,
-        capacity: u64,
+        segment_size: u64,
         file_pool_count: u32,
         file_pool_capacity: u32,
-        compaction_policy: CompactionPolicy,
     ) -> Result<Self>
     where
         P: AsRef<Path>,
@@ -90,14 +85,14 @@ impl BlobStorage {
             sealed,
             compacted,
             file_cache,
-            capacity,
-            compaction_policy,
+            segment_size,
         })
     }
 
-    fn hydrate_descriptors<S: ImmutableSegment + 'static>(
-        layout: &StorageLayout,
-    ) -> Result<HashMap<Uuid, Segment<S>>> {
+    fn hydrate_descriptors<S>(layout: &StorageLayout) -> Result<HashMap<Uuid, Segment<S>>>
+    where
+        S: ImmutableSegment + 'static,
+    {
         let dir = if TypeId::of::<S>() == TypeId::of::<Compacted>() {
             layout.compacted_dir()
         } else {
@@ -167,16 +162,16 @@ impl BlobStorage {
 impl BlobStorage {
     pub fn put(&mut self, file_id: Uuid, object_id: Uuid, data: &[u8]) -> Result<ObjectLocation> {
         let total_needed = align_to_page(OBJECT_HEADER_SIZE as u64 + data.len() as u64);
-        if total_needed > self.capacity {
+        if total_needed > self.segment_size {
             return Err(Error::StorageFull {
-                needed: total_needed - self.capacity,
+                needed: total_needed - self.segment_size,
             });
         }
 
         if self.active.is_none() {
             let id = Uuid::now_v7();
             let path = self.layout.path_for(id).active().build();
-            self.active = Some(Segment::<Active>::new(id, path, self.capacity)?);
+            self.active = Some(Segment::<Active>::new(id, path, self.segment_size)?);
         }
 
         let active = self
@@ -191,7 +186,7 @@ impl BlobStorage {
                 checksum,
             }) => {
                 let object_location = ObjectLocation {
-                    segment_id: active.id(),
+                    segment_id: active.id,
                     object_offset: ObjectOffset {
                         object_id,
                         offset,
@@ -222,7 +217,7 @@ impl BlobStorage {
             .take()
             .ok_or_else(|| Error::Internal("active segment lost at rotation".to_string()))?;
 
-        let old_id = old_active.id();
+        let old_id = old_active.id;
         let sealed_path = self.layout.path_for(old_id).sealed().build();
         let sealed_shard = self.layout.path_for(old_id).sealed().shard_dir();
 
@@ -235,12 +230,12 @@ impl BlobStorage {
         fs::rename(&sealed.path, &sealed_path)?;
         sealed.path = sealed_path;
 
-        self.sealed.insert(sealed.id(), sealed);
+        self.sealed.insert(sealed.id, sealed);
 
         let new_id = Uuid::now_v7();
         let new_path = self.layout.path_for(new_id).active().build();
 
-        let mut next_active = Segment::<Active>::new(new_id, new_path, self.capacity)?;
+        let mut next_active = Segment::<Active>::new(new_id, new_path, self.segment_size)?;
 
         let IngestedObject {
             offset,
@@ -270,7 +265,7 @@ impl BlobStorage {
 impl BlobStorage {
     pub fn get(&self, segment_id: &Uuid, offset: u64) -> Result<Vec<u8>> {
         if let Some(active) = self.active.as_ref()
-            && active.id() == *segment_id
+            && active.id == *segment_id
         {
             let (header, data) = active.read_object_at(&active.state.file, offset)?;
             return self.process_header_result(header, data);
@@ -308,7 +303,7 @@ impl BlobStorage {
         if self.active.is_none() {
             let id = Uuid::now_v7();
             let path = self.layout.path_for(id).active().build();
-            self.active = Some(Segment::<Active>::new(id, path, self.capacity)?);
+            self.active = Some(Segment::<Active>::new(id, path, self.segment_size)?);
         }
 
         let active = self
@@ -325,7 +320,7 @@ impl BlobStorage {
         };
 
         Ok(ObjectLocation {
-            segment_id: active.id(),
+            segment_id: active.id,
             object_offset: ObjectOffset {
                 object_id: Uuid::nil(),
                 offset: ingested.offset,
@@ -337,70 +332,151 @@ impl BlobStorage {
     }
 }
 
+// MARK: - Health
+
+impl BlobStorage {
+    pub fn get_all_stats<F>(&self, is_alive: F) -> Result<Vec<SegmentStats>>
+    where
+        F: FnMut(Uuid, Uuid, u64) -> bool,
+    {
+        self.inspect_immutable_segments_health(is_alive)
+    }
+
+    fn inspect_immutable_segments_health<F>(&self, mut is_alive: F) -> Result<Vec<SegmentStats>>
+    where
+        F: FnMut(Uuid, Uuid, u64) -> bool,
+    {
+        let mut all_stats = Vec::with_capacity(self.sealed.len() + self.compacted.len());
+
+        for segment in self.sealed.values() {
+            all_stats.push(self.check_segment_health(segment, &mut is_alive)?);
+        }
+
+        for segment in self.compacted.values() {
+            all_stats.push(self.check_segment_health(segment, &mut is_alive)?);
+        }
+
+        Ok(all_stats)
+    }
+
+    fn check_segment_health<S, F>(
+        &self,
+        segment: &Segment<S>,
+        is_alive: &mut F,
+    ) -> Result<SegmentStats>
+    where
+        S: SegmentState,
+        F: FnMut(Uuid, Uuid, u64) -> bool,
+    {
+        let id = segment.id;
+        let cached_file = self.file_cache.get(id, &segment.path)?;
+        segment.check_health(&cached_file, is_alive)
+    }
+}
+
 // MARK: - Compaction
 
-// impl BlobStorage {
-//     fn plan_compaction(&self) -> Option<CompactionPlan> {
-//         let sealed_count = self.sealed.len();
-//         let total_bytes: u64 = self
-//             .sealed
-//             .values()
-//             .map(|b| b.file.metadata().map(|m| m.len()).unwrap_or(0))
-//             .sum();
-//
-//         let count_trigger = sealed_count >= self.compaction_policy.max_sealed_files;
-//         let space_trigger = total_bytes > self.compaction_policy.max_sealed_bytes;
-//         if self.sealed.len() < 5 {
-//             return None;
-//         }
-//
-//         let candidates = self.sealed.keys().cloned().collect();
-//         Some(CompactionPlan { candidates })
-//     }
-//
-//     pub fn prepare_compaction<F>(&mut self, is_latest: F) -> io::Result<Option<CompactedBlob>>
-//     where
-//         F: Fn(u64, Uuid, u64) -> bool,
-//     {
-//         let plan = match self.plan_compaction() {
-//             Some(plan) => plan,
-//             None => return Ok(None),
-//         };
-//
-//         let sources: Vec<Segment<Sealed>> = plan
-//             .candidates
-//             .iter()
-//             .filter_map(|id| self.sealed.remove(id))
-//             .collect();
-//
-//         let result = sources.compact(
-//             self.base_dir.join(COMPACTED_DIR),
-//             self.threshold,
-//             self.page_size,
-//             is_latest,
-//         )?;
-//
-//         Ok(Some(result))
-//     }
-//
-//     pub fn commit_compaction(&mut self, result: CompactedBlob) -> io::Result<()> {
-//         let new_id = result.new_blob.id();
-//         self.compacted.insert(new_id, result.new_blob);
-//
-//         for path in result.removed_paths {
-//             fs::remove_file(path).ok();
-//         }
-//
-//         Ok(())
-//     }
-// }
+impl BlobStorage {
+    pub fn execute_compaction<F>(
+        &mut self,
+        plan: CompactionPlan,
+        mut is_alive: F,
+    ) -> Result<Vec<CompactedSegment>>
+    where
+        F: FnMut(Uuid, Uuid, u64) -> bool,
+    {
+        let mut results = Vec::new();
 
-pub struct StorageLayout {
+        for id in plan.promotion {
+            if let Some(mut segment) = self.sealed.remove(&id) {
+                let new_path = self.layout.path_for(id).compacted().build();
+                fs::rename(&segment.path, &new_path)?;
+                segment.path = new_path;
+                self.compacted.insert(id, segment.compacted());
+                results.push(CompactedSegment {
+                    segment_id: id,
+                    objects: Vec::new(),
+                    removed_segments: vec![id],
+                });
+            }
+        }
+
+        for merge_group in plan.merges {
+            let target_id = Uuid::now_v7();
+            let new_path = self.layout.path_for(target_id).compacted().build();
+            let mut writer = Segment::<Active>::new(target_id, new_path, self.segment_size)?;
+            let mut merged_objects = Vec::new();
+
+            for src_id in &merge_group {
+                if let Some(segment) = self.sealed.get(src_id) {
+                    let migrations = self.copy_live_objects(segment, &mut writer, &mut is_alive)?;
+                    merged_objects.extend_from_slice(&migrations);
+                } else if let Some(segment) = self.compacted.get(src_id) {
+                    let migrations = self.copy_live_objects(segment, &mut writer, &mut is_alive)?;
+                    merged_objects.extend_from_slice(&migrations);
+                } else {
+                    return Err(Error::Internal(format!("segment {src_id} lost")));
+                }
+            }
+
+            let new_compacted = writer.seal()?.compacted();
+            self.compacted.insert(target_id, new_compacted);
+
+            for src_id in &merge_group {
+                if let Some(segment) = self.sealed.remove(src_id) {
+                    fs::remove_file(&segment.path)?;
+                } else if let Some(segment) = self.compacted.remove(src_id) {
+                    fs::remove_file(&segment.path)?;
+                }
+            }
+
+            results.push(CompactedSegment {
+                segment_id: target_id,
+                objects: merged_objects,
+                removed_segments: merge_group,
+            });
+        }
+
+        Ok(results)
+    }
+
+    fn copy_live_objects<S, F>(
+        &self,
+        segment: &Segment<S>,
+        writer: &mut Segment<Active>,
+        is_alive: &mut F,
+    ) -> Result<Vec<CompactedObject>>
+    where
+        S: ImmutableSegment,
+        F: FnMut(Uuid, Uuid, u64) -> bool,
+    {
+        let mut compacted = Vec::new();
+        let file = self.file_cache.get(segment.id, &segment.path)?;
+
+        for object in segment.objects(&file)? {
+            let (offset_old, header) = object?;
+            if is_alive(segment.id, header.object_id(), offset_old) {
+                let (_header, data) = segment.read_object_at(&file, offset_old)?;
+                let ingested = writer.ingest(header.file_id(), header.object_id(), &data)?;
+                compacted.push(CompactedObject {
+                    object_id: header.object_id(),
+                    offset_new: ingested.offset,
+                });
+            }
+        }
+
+        Ok(compacted)
+    }
+}
+
+// MARK: - Layout
+
+struct StorageLayout {
     base_dir: PathBuf,
 }
 
 impl StorageLayout {
-    pub fn new<P>(base_dir: P) -> Self
+    fn new<P>(base_dir: P) -> Self
     where
         P: AsRef<Path>,
     {
@@ -409,31 +485,31 @@ impl StorageLayout {
         }
     }
 
-    pub fn initialize(&self) -> Result<()> {
+    fn initialize(&self) -> Result<()> {
         for dir in [ACTIVE_DIR, SEALED_DIR, COMPACTED_DIR] {
             fs::create_dir_all(self.base_dir.join(dir))?;
         }
         Ok(())
     }
 
-    pub fn active_dir(&self) -> PathBuf {
+    fn active_dir(&self) -> PathBuf {
         self.base_dir.join(ACTIVE_DIR)
     }
 
-    pub fn sealed_dir(&self) -> PathBuf {
+    fn sealed_dir(&self) -> PathBuf {
         self.base_dir.join(SEALED_DIR)
     }
 
-    pub fn compacted_dir(&self) -> PathBuf {
+    fn compacted_dir(&self) -> PathBuf {
         self.base_dir.join(COMPACTED_DIR)
     }
 
-    pub fn path_for(&self, id: Uuid) -> SegmentPathBuilder {
+    fn path_for(&self, id: Uuid) -> SegmentPathBuilder {
         SegmentPathBuilder::new(&self.base_dir, id)
     }
 }
 
-pub struct SegmentPathBuilder {
+struct SegmentPathBuilder {
     base_dir: PathBuf,
     id: Uuid,
     is_active: bool,
@@ -441,7 +517,7 @@ pub struct SegmentPathBuilder {
 }
 
 impl SegmentPathBuilder {
-    pub fn new<P>(base_dir: P, id: Uuid) -> SegmentPathBuilder
+    fn new<P>(base_dir: P, id: Uuid) -> SegmentPathBuilder
     where
         P: AsRef<Path>,
     {
@@ -453,25 +529,25 @@ impl SegmentPathBuilder {
         }
     }
 
-    pub fn active(mut self) -> Self {
+    fn active(mut self) -> Self {
         self.is_active = true;
         self.is_compacted = false;
         self
     }
 
-    pub fn sealed(mut self) -> Self {
+    fn sealed(mut self) -> Self {
         self.is_active = false;
         self.is_compacted = false;
         self
     }
 
-    pub fn compacted(mut self) -> Self {
+    fn compacted(mut self) -> Self {
         self.is_compacted = true;
         self.is_active = false;
         self
     }
 
-    pub fn shard_dir(self) -> PathBuf {
+    fn shard_dir(self) -> PathBuf {
         let sub_dir = if self.is_compacted {
             COMPACTED_DIR
         } else if self.is_active {
@@ -489,7 +565,7 @@ impl SegmentPathBuilder {
         }
     }
 
-    pub fn build(self) -> PathBuf {
+    fn build(self) -> PathBuf {
         let mut file_name = format!("{}{}{}", SEGMENT_PREFIX, self.id, SEGMENT_EXTENSION);
 
         if self.is_active {

@@ -1,62 +1,37 @@
 use uuid::Uuid;
 
 use crate::{
-    blob::{BlobStorage, CompactionPolicy, DATA_SIZE, OBJECT_SIZE, SEGMENT_SIZE},
+    blob::{BlobStorage, CompactionPlan, SegmentStatus},
+    config::{CompactionPolicy, StorageConfig},
     error::Result,
     metadata::MetadataStorage,
 };
 
-pub struct StorageConfig {
-    chunk_size: u64,
-    metadata_path: String,
-    blob_base_dir: String,
-    blob_segment_size: u64,
-    file_pool_count: u32,
-    file_pool_capacity: u32,
-}
-
-impl Default for StorageConfig {
-    fn default() -> Self {
-        let max_fd_open = rlimit::getrlimit(rlimit::Resource::NOFILE)
-            .map(|(soft, _hard)| (soft as u32) * 8 / 10)
-            .unwrap_or(512);
-
-        let file_pool_count = 16;
-        let file_pool_capacity = max_fd_open / file_pool_count;
-
-        Self {
-            chunk_size: OBJECT_SIZE,
-            metadata_path: "./data/metadata/vorst.redb".to_string(),
-            blob_base_dir: "./data/blob".to_string(),
-            blob_segment_size: SEGMENT_SIZE,
-            file_pool_count,
-            file_pool_capacity,
-        }
-    }
-}
-
 pub struct StorageCoordinator {
     metadata: MetadataStorage,
     blob: BlobStorage,
-    data_size_max: u64,
+    blob_segment_size: u64,
+    blob_data_size: u64,
+    compaction_policy: CompactionPolicy,
 }
 
 impl StorageCoordinator {
     pub fn open(config: StorageConfig) -> Result<Self> {
-        let metadata = MetadataStorage::open(&config.metadata_path)?;
+        let metadata = MetadataStorage::open(&config.metadata.path)?;
 
         let blob = BlobStorage::open(
-            &config.blob_base_dir,
-            config.blob_segment_size,
-            config.file_pool_count,
-            config.file_pool_capacity,
-            CompactionPolicy::default(),
+            &config.blob.base_dir,
+            config.blob.segment_size,
+            config.file_cache.shard_count,
+            config.file_cache.shard_capacity,
         )?;
 
         Ok(Self {
             metadata,
             blob,
-            data_size_max: DATA_SIZE,
+            blob_segment_size: config.blob.segment_size,
+            blob_data_size: config.blob.data_size,
+            compaction_policy: config.compaction_policy,
         })
     }
 
@@ -64,7 +39,7 @@ impl StorageCoordinator {
         let mut chunks = Vec::new();
 
         while !data.is_empty() {
-            let chunk_len = std::cmp::min(data.len() as u64, self.data_size_max) as usize;
+            let chunk_len = std::cmp::min(data.len() as u64, self.blob_data_size) as usize;
             let chunk_data = &data[..chunk_len];
 
             let object_id = Uuid::now_v7();
@@ -105,6 +80,92 @@ impl StorageCoordinator {
     pub fn delete_file(&mut self, file_id: Uuid) -> Result<()> {
         let _object_ids = self.metadata.delete_file(file_id)?;
         self.blob.delete(file_id)?;
+        Ok(())
+    }
+}
+
+impl StorageCoordinator {
+    pub fn prepare_compaction(&self) -> Result<CompactionPlan> {
+        let mut plan = CompactionPlan::default();
+
+        let stats = self.blob.get_all_stats(|segment_id, object_id, offset| {
+            self.metadata
+                .check_liveliness(segment_id, object_id, offset)
+                .unwrap_or(false)
+        })?;
+
+        let mut candidates = Vec::new();
+
+        for stat in stats {
+            if stat.fragmentation() <= self.compaction_policy.promotion_fragmentation_max
+                && stat.status == SegmentStatus::Sealed
+            {
+                plan.promotion.push(stat.id);
+                continue;
+            }
+
+            if stat.fragmentation() > self.compaction_policy.merge_fragmentation_min {
+                candidates.push(stat);
+                continue;
+            }
+
+            plan.deferred.push(stat.id);
+        }
+
+        candidates.sort_by_key(|c| c.live_bytes);
+
+        let mut merge_batch = Vec::new();
+        let mut merge_batch_size = 0;
+
+        let batch_size_threshold =
+            (self.blob_segment_size as f32 * self.compaction_policy.segment_fill_ratio) as u64;
+
+        for stat in candidates {
+            if merge_batch_size + stat.live_bytes > self.blob_segment_size
+                && merge_batch_size >= batch_size_threshold
+                && !merge_batch.is_empty()
+            {
+                plan.merges.push(std::mem::take(&mut merge_batch));
+                merge_batch_size = 0;
+            }
+
+            merge_batch_size += stat.live_bytes;
+            merge_batch.push(stat.id);
+        }
+
+        if !merge_batch.is_empty() {
+            if merge_batch_size >= batch_size_threshold || merge_batch.len() > 1 {
+                plan.merges.push(merge_batch);
+            } else {
+                plan.deferred.extend(merge_batch);
+            }
+        }
+
+        Ok(plan)
+    }
+
+    pub fn run_compaction(&mut self, plan: CompactionPlan) -> Result<()> {
+        let compacted_segments =
+            self.blob
+                .execute_compaction(plan, |segment_id, object_id, offset| {
+                    self.metadata
+                        .check_liveliness(segment_id, object_id, offset)
+                        .unwrap_or(false)
+                })?;
+
+        for result in compacted_segments {
+            let mut updates = Vec::new();
+
+            for object in result.objects {
+                let mut location = self.metadata.get_object_location(object.object_id)?;
+                location.segment_id = result.segment_id;
+                location.object_offset.offset = object.offset_new;
+                updates.push((object.object_id, location));
+            }
+
+            self.metadata.update_locations(updates)?;
+        }
+
         Ok(())
     }
 }

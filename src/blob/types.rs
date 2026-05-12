@@ -1,9 +1,7 @@
-use std::path::PathBuf;
-
-use chrono::Duration;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::blob::{segment::Segment, state::Compacted};
+use crate::blob::state::SegmentStatus;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectLocation {
@@ -20,41 +18,25 @@ pub struct ObjectOffset {
     pub flags: u16,
 }
 
-pub struct CompactionMap {
-    pub object_id: Uuid,
-    pub old_segment_id: Uuid,
-    pub old_offset: u64,
-    pub new_offset: u64,
+pub struct SegmentStats {
+    pub id: Uuid,
+    pub total_bytes: u64,
+    pub live_bytes: u64,
+    pub entry_count: u32,
+    pub status: SegmentStatus,
+    pub created_at: DateTime<Utc>,
 }
 
-pub struct CompactedSegment {
-    pub new_segment: Segment<Compacted>,
-    pub removed_segment_ids: Vec<Uuid>,
-    pub removed_paths: Vec<PathBuf>,
-}
-
-pub struct CompactionPlan {
-    pub candidates: Vec<Uuid>,
-}
-
-pub struct CompactionPolicy {
-    pub max_sealed_files: usize,
-    pub max_sealed_bytes: u64,
-    pub tombstone_threshold: f32,
-    pub min_interval: Duration,
-}
-
-impl Default for CompactionPolicy {
-    fn default() -> Self {
-        Self {
-            max_sealed_files: 10,
-            max_sealed_bytes: 20 * 1024 * 1024 * 1024,
-            tombstone_threshold: 0.3,
-            min_interval: Duration::seconds(3600),
+impl SegmentStats {
+    pub fn fragmentation(&self) -> f32 {
+        if self.total_bytes == 0 {
+            return 0.0;
         }
+        self.total_bytes.saturating_sub(self.live_bytes) as f32 / self.total_bytes as f32
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IngestedObject {
     pub offset: u64,
     pub length: u32,

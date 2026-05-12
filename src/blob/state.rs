@@ -1,8 +1,19 @@
 use std::fs::File;
 
-use crate::blob::{OBJECT_SIZE, types::CompactionMap, utils::AlignedBuffer};
+use crate::blob::{OBJECT_SIZE, utils::AlignedBuffer};
 
-pub trait SegmentState {}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SegmentStatus {
+    Active,
+    Sealed,
+    Compacted,
+}
+
+pub trait SegmentState {
+    fn status(&self) -> SegmentStatus;
+    fn total_bytes(&self) -> u64;
+}
+
 pub trait ImmutableSegment: SegmentState + Default {}
 
 pub struct Active {
@@ -14,16 +25,45 @@ pub struct Active {
 }
 
 #[derive(Default)]
-pub struct Sealed;
+pub struct Sealed {
+    pub total_bytes: u64,
+    pub entry_count: u32,
+}
 
 #[derive(Default)]
 pub struct Compacted {
-    pub mappings: Vec<CompactionMap>,
+    pub total_bytes: u64,
 }
 
-impl SegmentState for Active {}
-impl SegmentState for Sealed {}
-impl SegmentState for Compacted {}
+impl SegmentState for Active {
+    fn status(&self) -> SegmentStatus {
+        SegmentStatus::Active
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.write_cursor
+    }
+}
+
+impl SegmentState for Sealed {
+    fn status(&self) -> SegmentStatus {
+        SegmentStatus::Sealed
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+}
+
+impl SegmentState for Compacted {
+    fn status(&self) -> SegmentStatus {
+        SegmentStatus::Compacted
+    }
+
+    fn total_bytes(&self) -> u64 {
+        self.total_bytes
+    }
+}
 
 impl ImmutableSegment for Sealed {}
 impl ImmutableSegment for Compacted {}

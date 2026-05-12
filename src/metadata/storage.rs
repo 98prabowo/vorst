@@ -183,13 +183,13 @@ impl MetadataStorage {
         })
     }
 
-    pub fn check_liveliness(&self, object_id: Uuid, segment_id: Uuid, offset: u64) -> Result<bool> {
+    pub fn check_liveliness(&self, segment_id: Uuid, object_id: Uuid, offset: u64) -> Result<bool> {
         let read_tx = self.db.begin_read()?;
         let table = read_tx.open_table(OBJECT_TABLE)?;
 
         if let Some(guard) = table.get(object_id.into_bytes())? {
-            let (curr_seg, curr_offset, _, _, _) = guard.value();
-            Ok(curr_seg == segment_id.into_bytes() && curr_offset == offset)
+            let (stored_segment_id, stored_offset, _, _, _) = guard.value();
+            Ok(stored_segment_id == segment_id.into_bytes() && stored_offset == offset)
         } else {
             Ok(false)
         }

@@ -1,4 +1,5 @@
 mod blob;
+mod config;
 mod coordinator;
 mod error;
 mod id;
