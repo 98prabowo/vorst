@@ -337,14 +337,14 @@ impl BlobStorage {
 impl BlobStorage {
     pub fn get_all_stats<F>(&self, is_alive: F) -> Result<Vec<SegmentStats>>
     where
-        F: FnMut(Uuid, Uuid, u64) -> bool,
+        F: FnMut(Uuid, Uuid, Uuid, u64) -> bool,
     {
         self.inspect_immutable_segments_health(is_alive)
     }
 
     fn inspect_immutable_segments_health<F>(&self, mut is_alive: F) -> Result<Vec<SegmentStats>>
     where
-        F: FnMut(Uuid, Uuid, u64) -> bool,
+        F: FnMut(Uuid, Uuid, Uuid, u64) -> bool,
     {
         let mut all_stats = Vec::with_capacity(self.sealed.len() + self.compacted.len());
 
@@ -366,7 +366,7 @@ impl BlobStorage {
     ) -> Result<SegmentStats>
     where
         S: SegmentState,
-        F: FnMut(Uuid, Uuid, u64) -> bool,
+        F: FnMut(Uuid, Uuid, Uuid, u64) -> bool,
     {
         let id = segment.id;
         let cached_file = self.file_cache.get(id, &segment.path)?;
@@ -383,7 +383,7 @@ impl BlobStorage {
         mut is_alive: F,
     ) -> Result<Vec<CompactedSegment>>
     where
-        F: FnMut(Uuid, Uuid, u64) -> bool,
+        F: FnMut(Uuid, Uuid, Uuid, u64) -> bool,
     {
         let mut results = Vec::new();
 
@@ -448,14 +448,14 @@ impl BlobStorage {
     ) -> Result<Vec<CompactedObject>>
     where
         S: ImmutableSegment,
-        F: FnMut(Uuid, Uuid, u64) -> bool,
+        F: FnMut(Uuid, Uuid, Uuid, u64) -> bool,
     {
         let mut compacted = Vec::new();
         let file = self.file_cache.get(segment.id, &segment.path)?;
 
         for object in segment.objects(&file)? {
             let (offset_old, header) = object?;
-            if is_alive(segment.id, header.object_id(), offset_old) {
+            if is_alive(header.file_id(), segment.id, header.object_id(), offset_old) {
                 let (_header, data) = segment.read_object_at(&file, offset_old)?;
                 let ingested = writer.ingest(header.file_id(), header.object_id(), &data)?;
                 compacted.push(CompactedObject {

@@ -17,7 +17,7 @@ pub struct StorageCoordinator {
 
 impl StorageCoordinator {
     pub fn open(config: StorageConfig) -> Result<Self> {
-        let metadata = MetadataStorage::open(&config.metadata.path)?;
+        let metadata = MetadataStorage::open(config.metadata)?;
 
         let blob = BlobStorage::open(
             &config.blob.base_dir,
@@ -78,7 +78,7 @@ impl StorageCoordinator {
     }
 
     pub fn delete_file(&mut self, file_id: Uuid) -> Result<()> {
-        let _object_ids = self.metadata.delete_file(file_id)?;
+        self.metadata.delete_file(file_id)?;
         self.blob.delete(file_id)?;
         Ok(())
     }
@@ -88,11 +88,13 @@ impl StorageCoordinator {
     pub fn prepare_compaction(&self) -> Result<CompactionPlan> {
         let mut plan = CompactionPlan::default();
 
-        let stats = self.blob.get_all_stats(|segment_id, object_id, offset| {
-            self.metadata
-                .check_liveliness(segment_id, object_id, offset)
-                .unwrap_or(false)
-        })?;
+        let stats = self
+            .blob
+            .get_all_stats(|file_id, segment_id, object_id, offset| {
+                self.metadata
+                    .check_liveliness(file_id, segment_id, object_id, offset)
+                    .unwrap_or(false)
+            })?;
 
         let mut candidates = Vec::new();
 
@@ -147,9 +149,9 @@ impl StorageCoordinator {
     pub fn run_compaction(&mut self, plan: CompactionPlan) -> Result<()> {
         let compacted_segments =
             self.blob
-                .execute_compaction(plan, |segment_id, object_id, offset| {
+                .execute_compaction(plan, |file_id, segment_id, object_id, offset| {
                     self.metadata
-                        .check_liveliness(segment_id, object_id, offset)
+                        .check_liveliness(file_id, segment_id, object_id, offset)
                         .unwrap_or(false)
                 })?;
 
@@ -164,6 +166,16 @@ impl StorageCoordinator {
             }
 
             self.metadata.update_locations(updates)?;
+        }
+
+        Ok(())
+    }
+
+    pub fn cleanup_metadata_tombstones(&mut self) -> Result<()> {
+        let expired_files = self.metadata.get_expired_tombstones()?;
+
+        for file_id in expired_files {
+            self.metadata.cleanup_tombstoned_file(file_id)?;
         }
 
         Ok(())

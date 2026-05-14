@@ -1,5 +1,3 @@
-use chrono::Duration;
-
 use crate::blob::{DATA_SIZE, OBJECT_SIZE, SEGMENT_SIZE};
 
 pub struct StorageConfig {
@@ -61,12 +59,14 @@ impl Default for BlobStorageConfig {
 
 pub struct MetadataStorageConfig {
     pub path: String,
+    pub retention_policy: i64,
 }
 
 impl Default for MetadataStorageConfig {
     fn default() -> Self {
         Self {
             path: "./data/metadata/vorst.redb".to_string(),
+            retention_policy: 3600,
         }
     }
 }

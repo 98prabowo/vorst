@@ -6,6 +6,9 @@ pub type Result<T> = std::result::Result<T, Error>;
 #[derive(Debug, Error)]
 pub enum Error {
     // --- Redb Specific Conversions ---
+    #[error("Redb error: {0}")]
+    Redb(#[from] redb::Error),
+
     #[error("Database error: {0}")]
     Database(#[from] redb::DatabaseError),
 

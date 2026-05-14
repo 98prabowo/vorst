@@ -87,7 +87,7 @@ impl<S: SegmentState> Segment<S> {
 
     pub fn check_health<F>(&self, file: &File, is_alive: &mut F) -> Result<SegmentStats>
     where
-        F: FnMut(Uuid, Uuid, u64) -> bool,
+        F: FnMut(Uuid, Uuid, Uuid, u64) -> bool,
     {
         let mut live_bytes = 0u64;
         let mut live_count = 0u32;
@@ -99,7 +99,7 @@ impl<S: SegmentState> Segment<S> {
                 continue;
             }
 
-            if is_alive(self.id, header.object_id(), offset) {
+            if is_alive(header.file_id(), self.id, header.object_id(), offset) {
                 live_bytes += header.data_len() as u64;
                 live_count += 1;
             }
